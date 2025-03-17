@@ -37,10 +37,12 @@
 
  **四、通配符高级用法** 
 
-`com.tencent.tmgp.sgame{Unity*}=6-7`
+- `com.tencent.tmgp.sgame{Unity*}=6-7`
+
 匹配所有Unity开头的线程（如UnityMain、UnityGfxDeviceW）
 
 - `com.example.app{*Main}=4-6`
+
 匹配所有以Main结尾的线程
 
  **五、规则编写指南** 
