@@ -3,35 +3,59 @@
 #### 介绍
 一个使用C语言编写，支持定义规则的安卓应用与游戏线程优化程序
 
-#### 软件架构
-软件架构说明
 
+一、核心概念与配置
+1. 配置文件路径
+/data/adb/modules/AppOpt/applist.conf
+2. 处理器架构示例（以高通骁龙888八核处理器为例）
+采用了4+3+1核心设计：
 
-#### 安装教程
+0-3：四颗A55小核（能效核心）
+4-6：三颗A78中核（性能核心）
+7：一颗X1大核（高性能核心）
+0-7：全部核心
+二、规则解析与示例
+示例1 进程级规则：应用包名=核心范围
+com.tencent.tmgp.sgame=4-7
+将王者荣耀所有线程绑定到CPU4-7（性能核心）
 
-1.  xxxx
-2.  xxxx
-3.  xxxx
+示例2 线程级规则：应用包名{线程名}=核心范围
+com.tencent.tmgp.sgame{UnityMain}=7
+精准绑定王者荣耀的UnityMain线程到超大核心7
 
-#### 使用说明
+三、CPU核心范围表示法
+4-7 ➔ 4到7（CPU4,5,6,7）
+4,7 ➔ 4与7（CPU4,7）
+0-3,7 ➔ 0到3与7（CPU0,1,2,3,7）
+四、通配符高级用法
+com.tencent.tmgp.sgame{Unity*}=6-7
+匹配所有Unity开头的线程（如UnityMain、UnityGfxDeviceW）
 
-1.  xxxx
-2.  xxxx
-3.  xxxx
+com.example.app{*Main}=4-6
+匹配所有以Main结尾的线程
 
-#### 参与贡献
+五、规则编写指南
+线程分配应该遵循高占用线程优先分配性能核心，中/低占用分配到中/小核心簇，避免线程间争抢资源。
+单个线程在任意时刻只能在一个CPU核心上执行指令，其指令流具有顺序性和依赖性，无法被拆分到多个核心并行处理。
+线程级规则优先级高于进程级。
+王者荣耀优化示例
+例如我手机CPU为高通骁龙8 Elite，采用了6+2核心设计，有六颗中核（0-5）与两颗高性能大核（6-7），而王者荣耀UnityMain与UnityGfxDeviceW两个线程CPU占用是最大的，那么我可以将优化规则写为
 
-1.  Fork 本仓库
-2.  新建 Feat_xxx 分支
-3.  提交代码
-4.  新建 Pull Request
+com.tencent.tmgp.sgame=0-5
+com.tencent.tmgp.sgame{Unity*}=6-7
+它表示将Unity开头的两个高占用线程绑定到高性能大核，其它线程绑定到0-5。
 
+FTP应用优化示例
+com.ftpshare=4-7
+例如我手机上有一个FTP共享文件的应用，它的优化不太好，老是跑在小核心上，导致文件共享的速度不够快，那么我为它添加上述规则，就可以提升文件共享速度了。
 
-#### 特技
+六、优化验证与调试
+推荐工具：
 
-1.  使用 Readme\_XXX.md 来支持不同的语言，例如 Readme\_en.md, Readme\_zh.md
-2.  Gitee 官方博客 [blog.gitee.com](https://blog.gitee.com)
-3.  你可以 [https://gitee.com/explore](https://gitee.com/explore) 这个地址来了解 Gitee 上的优秀开源项目
-4.  [GVP](https://gitee.com/gvp) 全称是 Gitee 最有价值开源项目，是综合评定出的优秀开源项目
-5.  Gitee 官方提供的使用手册 [https://gitee.com/help](https://gitee.com/help)
-6.  Gitee 封面人物是一档用来展示 Gitee 会员风采的栏目 [https://gitee.com/gitee-stars/](https://gitee.com/gitee-stars/)
+Scene8 中的线程监视器
+其它类似的性能分析工具
+验证步骤：
+
+观察每个线程CPU核心占用后为其合理分配核心
+这条规则实际性能优化表现（帧率/延迟）
+合理的线程规划可以让游戏帧率更稳定的同时功耗更低
