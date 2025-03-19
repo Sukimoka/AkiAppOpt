@@ -452,6 +452,14 @@ thread_error:
 static bool apply_affinity(const ProcessInfo* proc, const CpuTopology* topo) {
     bool applied = false;
 
+    if (topo->cpuset_enabled) {
+        int fd = open("/dev/cpuset/AppOpt/tasks", O_WRONLY | O_APPEND);
+        if (fd != -1) {
+            dprintf(fd, "%d\n", proc->pid);
+            close(fd);
+        }
+    }
+
     for (size_t i = 0; i < proc->num_threads; i++) {
         const ThreadInfo* ti = &proc->threads[i];
         cpu_set_t curr;
@@ -461,13 +469,6 @@ static bool apply_affinity(const ProcessInfo* proc, const CpuTopology* topo) {
             continue;
 
         if (!CPU_EQUAL(&ti->cpus, &curr)) {
-            if (topo->cpuset_enabled) {
-                int fd = open("/dev/cpuset/AppOpt/tasks", O_WRONLY | O_APPEND);
-                if (fd != -1) {
-                    dprintf(fd, "%d\n", ti->tid);
-                    close(fd);
-                }
-            }
             if (sched_setaffinity(ti->tid, sizeof(ti->cpus), &ti->cpus) == 0) {
                 applied = true;
             }
