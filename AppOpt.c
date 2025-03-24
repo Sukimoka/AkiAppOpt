@@ -79,6 +79,58 @@ static char* strtrim(char* s) {
     return s;
 }
 
+static bool is_screen_on(void) {
+    bool has_backlight = false;
+    int dir_fd = open("/sys/class/backlight", O_RDONLY | O_DIRECTORY);
+    if (dir_fd >= 0) {
+        DIR* dir = fdopendir(dir_fd);
+        if (dir) {
+            struct dirent* ent;
+            while ((ent = readdir(dir))) {
+                if (ent->d_name[0] == '.') continue;
+
+                int bl_fd = openat(dir_fd, ent->d_name, O_RDONLY | O_DIRECTORY);
+                if (bl_fd < 0) continue;
+
+                int val_fd = openat(bl_fd, "brightness", O_RDONLY);
+                close(bl_fd);
+
+                if (val_fd >= 0) {
+                    has_backlight = true;
+                    char buf[32] = {0};
+                    ssize_t n = read(val_fd, buf, sizeof(buf) - 1);
+                    close(val_fd);
+                    if (n > 0) {
+                        long value = strtol(buf, NULL, 10);
+                        if (value > 0) {
+                            closedir(dir);
+                            return true;
+                        }
+                    }
+                }
+            }
+            closedir(dir);
+        } else {
+            close(dir_fd);
+        }
+    }
+
+    if (has_backlight) return false;
+    FILE* fp = popen("dumpsys deviceidle get screen 2>/dev/null", "r");
+    if (fp) {
+        char buf[32] = {0};
+        size_t n = fread(buf, 1, sizeof(buf) - 1, fp);
+        buf[n] = '\0';
+        pclose(fp);
+        if (strstr(buf, "false") == NULL) {
+            return true;
+        } else {
+            return false;
+        }
+    }
+    return true;
+}
+
 static void parse_cpu_ranges(const char* spec, cpu_set_t* set, const cpu_set_t* present) {
     if (!spec || !set) return;
     char* copy = strdup(spec);
@@ -452,14 +504,6 @@ thread_error:
 static bool apply_affinity(const ProcessInfo* proc, const CpuTopology* topo) {
     bool applied = false;
 
-    if (topo->cpuset_enabled) {
-        int fd = open("/dev/cpuset/AppOpt/tasks", O_WRONLY | O_APPEND);
-        if (fd != -1) {
-            dprintf(fd, "%d\n", proc->pid);
-            close(fd);
-        }
-    }
-
     for (size_t i = 0; i < proc->num_threads; i++) {
         const ThreadInfo* ti = &proc->threads[i];
         cpu_set_t curr;
@@ -469,6 +513,13 @@ static bool apply_affinity(const ProcessInfo* proc, const CpuTopology* topo) {
             continue;
 
         if (!CPU_EQUAL(&ti->cpus, &curr)) {
+            if (topo->cpuset_enabled) {
+                int fd = open("/dev/cpuset/AppOpt/tasks", O_WRONLY | O_APPEND);
+                if (fd != -1) {
+                    dprintf(fd, "%d\n", ti->tid);
+                    close(fd);
+                }
+            }
             if (sched_setaffinity(ti->tid, sizeof(ti->cpus), &ti->cpus) == 0) {
                 applied = true;
             }
@@ -484,8 +535,13 @@ int main(void) {
     time_t last_affinity_time = 0;
 
     for (;;) {
-        const time_t now = time(NULL);
+        if (!is_screen_on()) {
+            nanosleep(&(struct timespec){12, 0}, NULL);
+            cache.last_update = 0;
+            continue;
+        }
 
+        const time_t now = time(NULL);
         if (now - last_config_check >= CONFIG_RELOAD_TIME) {
             if (load_config(&config)) {
                 cache.last_update = 0;
