@@ -13,7 +13,6 @@
 #include <unistd.h>
 
 #define CONFIG_FILE        "./applist.conf"
-#define CONFIG_RELOAD_TIME 10
 #define PROC_CACHE_TIME    10
 #define MAX_PKG_LEN        128
 #define MAX_THREAD_LEN     32
@@ -61,14 +60,6 @@ typedef struct {
     time_t last_update;
 } ProcCache;
 
-static inline void* xrealloc(void* ptr, size_t size) {
-    void* p = realloc(ptr, size);
-    if (!p && size != 0) {
-        return NULL;
-    }
-    return p;
-}
-
 static char* strtrim(char* s) {
     char* end;
     while (isspace(*s)) s++;
@@ -110,9 +101,7 @@ static bool is_screen_on(void) {
                 }
             }
             closedir(dir);
-        } else {
-            close(dir_fd);
-        }
+        } else close(dir_fd);
     }
 
     if (has_backlight) return false;
@@ -122,11 +111,7 @@ static bool is_screen_on(void) {
         size_t n = fread(buf, 1, sizeof(buf) - 1, fp);
         buf[n] = '\0';
         pclose(fp);
-        if (strstr(buf, "false") == NULL) {
-            return true;
-        } else {
-            return false;
-        }
+        return !strstr(buf, "false");
     }
     return true;
 }
@@ -234,14 +219,13 @@ static bool load_config(AppConfig* cfg) {
     if (!fp) return false;
 
     AffinityRule* new_rules = NULL;
-    size_t count = 0;
-    char line[256];
     char** new_pkgs = NULL;
-    size_t pkgs_count = 0;
+    size_t count = 0, pkgs_count = 0;
+    char line[256];
 
     while (fgets(line, sizeof(line), fp)) {
         char* p = strtrim(line);
-        if (*p == '#' || *p == 0) continue;
+        if (*p == '#' || !*p) continue;
 
         char* eq = strchr(p, '=');
         if (!eq) continue;
@@ -268,47 +252,34 @@ static bool load_config(AppConfig* cfg) {
         strncpy(rule.thread, thread, sizeof(rule.thread) - 1);
         rule.thread[sizeof(rule.thread)-1] = '\0';
         parse_cpu_ranges(cpus, &rule.cpus, &cfg->topo.present_cpus);
-
-        AffinityRule* tmp = xrealloc(new_rules, (count + 1) * sizeof(AffinityRule));
+        bool pkg_exists = false;
+        for (size_t i = 0; i < pkgs_count; i++) {
+            if (strcmp(new_pkgs[i], pkg) == 0) {
+                pkg_exists = true;
+                break;
+            }
+        }
+        if (!pkg_exists) {
+            char** tmp = realloc(new_pkgs, (pkgs_count+1)*sizeof(char*));
+            if (!tmp) goto error;
+            new_pkgs = tmp;
+            new_pkgs[pkgs_count] = strdup(pkg);
+            if (!new_pkgs[pkgs_count]) goto error;
+            pkgs_count++;
+        }
+        AffinityRule* tmp = realloc(new_rules, (count+1)*sizeof(AffinityRule));
         if (!tmp) goto error;
         new_rules = tmp;
         new_rules[count++] = rule;
     }
 
-    if (count == 0) {
-        free(new_rules);
-        fclose(fp);
-        return false;
-    }
+    if (count == 0) goto error;
+    free(cfg->rules);
+    for (size_t i = 0; i < cfg->num_pkgs; i++) free(cfg->pkgs[i]);
+    free(cfg->pkgs);
 
-    for (size_t i = 0; i < count; i++) {
-        const char* current_pkg = new_rules[i].pkg;
-        bool exists = false;
-        for (size_t j = 0; j < pkgs_count; j++) {
-            if (strcmp(current_pkg, new_pkgs[j]) == 0) {
-                exists = true;
-                break;
-            }
-        }
-        if (exists) continue;
-
-        char** tmp = xrealloc(new_pkgs, (pkgs_count + 1) * sizeof(char*));
-        if (!tmp) goto error;
-        new_pkgs = tmp;
-
-        new_pkgs[pkgs_count] = strdup(current_pkg);
-        if (!new_pkgs[pkgs_count]) goto error;
-        pkgs_count++;
-    }
-
-    if (cfg->rules) free(cfg->rules);
     cfg->rules = new_rules;
     cfg->num_rules = count;
-
-    if (cfg->pkgs) {
-        for (size_t i = 0; i < cfg->num_pkgs; i++) free(cfg->pkgs[i]);
-        free(cfg->pkgs);
-    }
     cfg->pkgs = new_pkgs;
     cfg->num_pkgs = pkgs_count;
 
@@ -318,10 +289,8 @@ static bool load_config(AppConfig* cfg) {
 
 error:
     free(new_rules);
-    if (new_pkgs) {
-        for (size_t i = 0; i < pkgs_count; i++) free(new_pkgs[i]);
-        free(new_pkgs);
-    }
+    for (size_t i = 0; i < pkgs_count; i++) free(new_pkgs[i]);
+    free(new_pkgs);
     fclose(fp);
     return false;
 }
@@ -332,8 +301,12 @@ static ProcCache* update_proc_cache(ProcCache* cache, const AppConfig* cfg) {
 
     DIR* proc_dir = opendir("/proc");
     if (!proc_dir) return cache;
-
-    ProcessInfo* new_procs = NULL;
+    size_t proc_cap = 256;
+    ProcessInfo* new_procs = malloc(proc_cap * sizeof(ProcessInfo));
+    if (!new_procs) {
+        closedir(proc_dir);
+        return cache;
+    }
     size_t count = 0;
     int proc_fd = dirfd(proc_dir);
     struct dirent* ent;
@@ -343,11 +316,10 @@ static ProcCache* update_proc_cache(ProcCache* cache, const AppConfig* cfg) {
             continue;
 
         pid_t pid = atoi(ent->d_name);
-        char cmd[MAX_PKG_LEN] = {0};
-
         int pid_fd = openat(proc_fd, ent->d_name, O_RDONLY | O_DIRECTORY);
         if (pid_fd == -1) continue;
 
+        char cmd[MAX_PKG_LEN] = {0};
         int cmd_fd = openat(pid_fd, "cmdline", O_RDONLY);
         if (cmd_fd == -1) {
             close(pid_fd);
@@ -364,7 +336,6 @@ static ProcCache* update_proc_cache(ProcCache* cache, const AppConfig* cfg) {
         cmd[n] = '\0';
         char* name = strrchr(cmd, '/');
         name = name ? name + 1 : cmd;
-
         bool found_pkg = false;
         for (size_t j = 0; j < cfg->num_pkgs; j++) {
             if (strcmp(name, cfg->pkgs[j]) == 0) {
@@ -383,7 +354,8 @@ static ProcCache* update_proc_cache(ProcCache* cache, const AppConfig* cfg) {
         proc.pkg[sizeof(proc.pkg)-1] = '\0';
         CPU_ZERO(&proc.base_cpus);
 
-        proc.thread_rules = NULL;
+        size_t thrules_cap = 4;
+        proc.thread_rules = malloc(thrules_cap * sizeof(AffinityRule*));
         proc.num_thread_rules = 0;
 
         for (size_t i = 0; i < cfg->num_rules; i++) {
@@ -391,10 +363,13 @@ static ProcCache* update_proc_cache(ProcCache* cache, const AppConfig* cfg) {
             if (strcmp(rule->pkg, proc.pkg) != 0) continue;
 
             if (rule->thread[0]) {
-                AffinityRule** tmp = xrealloc(proc.thread_rules,
-                    (proc.num_thread_rules + 1) * sizeof(AffinityRule*));
-                if (!tmp) continue;
-                proc.thread_rules = tmp;
+                if (proc.num_thread_rules >= thrules_cap) {
+                    thrules_cap *= 2;
+                    AffinityRule** tmp = realloc(proc.thread_rules,
+                        thrules_cap * sizeof(AffinityRule*));
+                    if (!tmp) break;
+                    proc.thread_rules = tmp;
+                }
                 proc.thread_rules[proc.num_thread_rules++] = (AffinityRule*)rule;
             } else {
                 CPU_OR(&proc.base_cpus, &proc.base_cpus, &rule->cpus);
@@ -409,7 +384,6 @@ static ProcCache* update_proc_cache(ProcCache* cache, const AppConfig* cfg) {
 
         int task_fd = openat(pid_fd, "task", O_RDONLY | O_DIRECTORY);
         close(pid_fd);
-
         if (task_fd == -1) {
             free(proc.thread_rules);
             continue;
@@ -422,9 +396,11 @@ static ProcCache* update_proc_cache(ProcCache* cache, const AppConfig* cfg) {
             continue;
         }
 
-        ThreadInfo* threads = NULL;
+        size_t thread_cap = 128;
+        ThreadInfo* threads = malloc(thread_cap * sizeof(ThreadInfo));
         size_t tcount = 0;
         struct dirent* tent;
+
         while ((tent = readdir(task_dir))) {
             if (tent->d_type != DT_DIR || !isdigit(tent->d_name[0]))
                 continue;
@@ -432,9 +408,11 @@ static ProcCache* update_proc_cache(ProcCache* cache, const AppConfig* cfg) {
             pid_t tid = atoi(tent->d_name);
             char tname[MAX_THREAD_LEN] = {0};
 
-            char comm_path[64];
-            snprintf(comm_path, sizeof(comm_path), "%s/comm", tent->d_name);
-            int comm_fd = openat(task_fd, comm_path, O_RDONLY);
+            int tid_fd = openat(task_fd, tent->d_name, O_RDONLY | O_DIRECTORY);
+            if (tid_fd == -1) continue;
+
+            int comm_fd = openat(tid_fd, "comm", O_RDONLY);
+            close(tid_fd);
             if (comm_fd == -1) continue;
 
             ssize_t n = read(comm_fd, tname, sizeof(tname) - 1);
@@ -452,41 +430,40 @@ static ProcCache* update_proc_cache(ProcCache* cache, const AppConfig* cfg) {
                 }
             }
 
+            if (tcount >= thread_cap) {
+                thread_cap *= 2;
+                ThreadInfo* tmp = realloc(threads, thread_cap * sizeof(ThreadInfo));
+                if (!tmp) continue;
+                threads = tmp;
+            }
+
             ThreadInfo ti = {
                 .tid = tid,
                 .cpus = CPU_COUNT(&mask) ? mask : proc.base_cpus
             };
             strncpy(ti.name, tname, sizeof(ti.name) - 1);
             ti.name[sizeof(ti.name)-1] = '\0';
-
-            ThreadInfo* tmp = xrealloc(threads, (tcount + 1) * sizeof(ThreadInfo));
-            if (!tmp) goto thread_error;
-            threads = tmp;
             threads[tcount++] = ti;
         }
 
         proc.threads = threads;
         proc.num_threads = tcount;
 
-        ProcessInfo* tmp = xrealloc(new_procs, (count + 1) * sizeof(ProcessInfo));
-        if (!tmp) {
-            free(threads);
-            free(proc.thread_rules);
-            closedir(task_dir);
-            continue;
+        if (count >= proc_cap) {
+            proc_cap *= 2;
+            ProcessInfo* tmp = realloc(new_procs, proc_cap * sizeof(ProcessInfo));
+            if (!tmp) {
+                free(threads);
+                free(proc.thread_rules);
+                closedir(task_dir);
+                break;
+            }
+            new_procs = tmp;
         }
-        new_procs = tmp;
         new_procs[count++] = proc;
-        closedir(task_dir);
-        continue;
-
-thread_error:
-        free(threads);
-        free(proc.thread_rules);
         closedir(task_dir);
     }
     closedir(proc_dir);
-
     if (cache->procs) {
         for (size_t i = 0; i < cache->num_procs; i++) {
             free(cache->procs[i].threads);
@@ -542,7 +519,7 @@ int main(void) {
         }
 
         const time_t now = time(NULL);
-        if (now - last_config_check >= CONFIG_RELOAD_TIME) {
+        if (now - last_config_check >= 15) {
             if (load_config(&config)) {
                 cache.last_update = 0;
             }
