@@ -13,7 +13,7 @@
 #include <unistd.h>
 
 #define CONFIG_FILE        "./applist.conf"
-#define PROC_CACHE_TIME    10
+#define PROC_CACHE_TIME    9
 #define MAX_PKG_LEN        128
 #define MAX_THREAD_LEN     32
 
@@ -301,7 +301,7 @@ static ProcCache* update_proc_cache(ProcCache* cache, const AppConfig* cfg) {
 
     DIR* proc_dir = opendir("/proc");
     if (!proc_dir) return cache;
-    size_t proc_cap = 256;
+    size_t proc_cap = 2048;
     ProcessInfo* new_procs = malloc(proc_cap * sizeof(ProcessInfo));
     if (!new_procs) {
         closedir(proc_dir);
@@ -535,9 +535,9 @@ int main(void) {
         if (applied) last_affinity_time = now;
 
         struct timespec delay;
-        if (now - last_affinity_time <= 5) {
-            delay.tv_sec = 0;
-            delay.tv_nsec = 500000000;
+        if (now - last_affinity_time <= 6) {
+            delay.tv_sec = 1;
+            delay.tv_nsec = 0;
         } else {
             delay.tv_sec = 3;
             delay.tv_nsec = 0;
