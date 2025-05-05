@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 #include <ctype.h>
 #include <dirent.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <fnmatch.h>
 #include <sched.h>
@@ -9,29 +10,30 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
-#include <time.h>
 #include <unistd.h>
 
-#define CONFIG_FILE        "./applist.conf"
-#define PROC_CACHE_TIME    9
+#define BASE_CPUSET        "/dev/cpuset/AppOpt"
 #define MAX_PKG_LEN        128
 #define MAX_THREAD_LEN     32
 
 typedef struct {
     char pkg[MAX_PKG_LEN];
     char thread[MAX_THREAD_LEN];
+    char cpuset_dir[256];
     cpu_set_t cpus;
 } AffinityRule;
 
 typedef struct {
     pid_t tid;
     char name[MAX_THREAD_LEN];
+    char cpuset_dir[256];
     cpu_set_t cpus;
 } ThreadInfo;
 
 typedef struct {
     pid_t pid;
     char pkg[MAX_PKG_LEN];
+    char base_cpuset[128];
     cpu_set_t base_cpus;
     ThreadInfo* threads;
     size_t num_threads;
@@ -41,8 +43,10 @@ typedef struct {
 
 typedef struct {
     cpu_set_t present_cpus;
+    char present_str[128];
+    char mems_str[32];
     bool cpuset_enabled;
-    char present_str[256];
+    int base_cpuset_fd;
 } CpuTopology;
 
 typedef struct {
@@ -52,12 +56,13 @@ typedef struct {
     CpuTopology topo;
     char** pkgs;
     size_t num_pkgs;
+    char config_file[4096];
 } AppConfig;
 
 typedef struct {
     ProcessInfo* procs;
     size_t num_procs;
-    time_t last_update;
+    int last_proc_count;
 } ProcCache;
 
 static char* strtrim(char* s) {
@@ -70,157 +75,184 @@ static char* strtrim(char* s) {
     return s;
 }
 
-static bool is_screen_on(void) {
-    bool has_backlight = false;
-    int dir_fd = open("/sys/class/backlight", O_RDONLY | O_DIRECTORY);
-    if (dir_fd >= 0) {
-        DIR* dir = fdopendir(dir_fd);
-        if (dir) {
-            struct dirent* ent;
-            while ((ent = readdir(dir))) {
-                if (ent->d_name[0] == '.') continue;
-
-                int bl_fd = openat(dir_fd, ent->d_name, O_RDONLY | O_DIRECTORY);
-                if (bl_fd < 0) continue;
-
-                int val_fd = openat(bl_fd, "brightness", O_RDONLY);
-                close(bl_fd);
-
-                if (val_fd >= 0) {
-                    has_backlight = true;
-                    char buf[32] = {0};
-                    ssize_t n = read(val_fd, buf, sizeof(buf) - 1);
-                    close(val_fd);
-                    if (n > 0) {
-                        long value = strtol(buf, NULL, 10);
-                        if (value > 0) {
-                            closedir(dir);
-                            return true;
-                        }
-                    }
-                }
-            }
-            closedir(dir);
-        } else close(dir_fd);
+static bool read_file(int dir_fd, const char* filename, char* buf, size_t buf_size) {
+    int fd = openat(dir_fd, filename, O_RDONLY | O_CLOEXEC);
+    if (fd == -1) return false;
+    ssize_t total = 0;
+    while (total < (ssize_t)(buf_size - 1)) {
+        ssize_t n = read(fd, buf + total, buf_size - 1 - total);
+        if (n == -1) {
+            if (errno == EINTR) continue;
+            break;
+        }
+        if (n == 0) break;
+        total += n;
     }
+    close(fd);
+    if (total <= 0) return false;
+    buf[total] = '\0';
+    return true;
+}
 
-    if (has_backlight) return false;
-    FILE* fp = popen("dumpsys deviceidle get screen 2>/dev/null", "r");
-    if (fp) {
-        char buf[32] = {0};
-        size_t n = fread(buf, 1, sizeof(buf) - 1, fp);
-        buf[n] = '\0';
-        pclose(fp);
-        return !strstr(buf, "false");
+static bool write_file(int dir_fd, const char* filename, const char* content, int flags) {
+    int fd = openat(dir_fd, filename, flags | O_CLOEXEC, 0644);
+    if (fd == -1) return false;
+    const char* ptr = content;
+    size_t remaining = strlen(content);
+    while (remaining > 0) {
+        ssize_t n = write(fd, ptr, remaining);
+        if (n == -1) {
+            if (errno == EINTR) continue;
+            close(fd);
+            return false;
+        }
+        ptr += n;
+        remaining -= n;
     }
+    close(fd);
     return true;
 }
 
 static void parse_cpu_ranges(const char* spec, cpu_set_t* set, const cpu_set_t* present) {
-    if (!spec || !set) return;
+    if (!spec) return;
     char* copy = strdup(spec);
     if (!copy) return;
     char* s = copy;
-    char* e;
 
-    while (s) {
-        e = strchr(s, ',');
-        if (e) *e++ = '\0';
-
-        unsigned a, b;
-        if (sscanf(s, "%u-%u", &a, &b) == 2) {
-            if (a > b) { unsigned t = a; a = b; b = t; }
-        } else if (sscanf(s, "%u", &a) == 1) {
-            b = a;
-        } else {
-            s = e;
+    while (*s) {
+        char* end;
+        unsigned long a = strtoul(s, &end, 10);
+        if (end == s) {
+            s++;
             continue;
         }
 
-        for (; a <= b && a < CPU_SETSIZE; a++) {
-            if (present && !CPU_ISSET(a, present)) continue;
-            CPU_SET(a, set);
+        unsigned long b = a;
+        if (*end == '-') {
+            s = end + 1;
+            b = strtoul(s, &end, 10);
+            if (end == s) b = a;
         }
-        s = e;
+
+        if (a > b) { unsigned long t = a; a = b; b = t; }
+        for (unsigned long i = a; i <= b && i < CPU_SETSIZE; i++) {
+            if (present && !CPU_ISSET(i, present)) continue;
+            CPU_SET(i, set);
+        }
+
+        s = (*end == ',') ? end + 1 : end;
     }
     free(copy);
 }
 
+static char* cpu_set_to_str(const cpu_set_t *set) {
+    size_t buf_size = 8 * CPU_SETSIZE;
+    char *buf = malloc(buf_size);
+    if (!buf) return NULL;
+    int start = -1, end = -1;
+    char *p = buf;
+    size_t remain = buf_size - 1;
+    bool first = true;
+
+    for (int i = 0; i < CPU_SETSIZE; i++) {
+        if (CPU_ISSET(i, set)) {
+            if (start == -1) {
+                start = end = i;
+            } else if (i == end + 1) {
+                end = i;
+            } else {
+                int needed;
+                if (start == end) {
+                    needed = snprintf(p, remain + 1, "%s%d", first ? "" : ",", start);
+                } else {
+                    needed = snprintf(p, remain + 1, "%s%d-%d", first ? "" : ",", start, end);
+                }
+                if (needed < 0 || (size_t)needed > remain) {
+                    free(buf);
+                    return NULL;
+                }
+                p += needed;
+                remain -= needed;
+                start = end = i;
+                first = false;
+            }
+        }
+    }
+    if (start != -1) {
+        int needed;
+        if (start == end) {
+            needed = snprintf(p, remain + 1, "%s%d", first ? "" : ",", start);
+        } else {
+            needed = snprintf(p, remain + 1, "%s%d-%d", first ? "" : ",", start, end);
+        }
+        if (needed < 0 || (size_t)needed > remain) {
+            free(buf);
+            return NULL;
+        }
+        p += needed;
+    }
+    *p = '\0';
+    return buf;
+}
+
+static bool create_cpuset_dir(const char *path, const char *cpus, const char *mems) {
+    if (mkdir(path, 0755) != 0 && errno != EEXIST) return false;
+    if (chmod(path, 0755) != 0) return false;
+    if (chown(path, 0, 0) != 0) return false;
+
+    char cpus_path[256];
+    snprintf(cpus_path, sizeof(cpus_path), "%s/cpus", path);
+    if (!write_file(AT_FDCWD, cpus_path, cpus, O_WRONLY | O_CREAT | O_TRUNC)) return false;
+
+    char mems_path[256];
+    snprintf(mems_path, sizeof(mems_path), "%s/mems", path);
+    return write_file(AT_FDCWD, mems_path, mems, O_WRONLY | O_CREAT | O_TRUNC);
+}
+
 static CpuTopology init_cpu_topo(void) {
-    CpuTopology topo = { .cpuset_enabled = false };
+    CpuTopology topo = { .cpuset_enabled = false, .base_cpuset_fd = -1 };
     CPU_ZERO(&topo.present_cpus);
-    memset(topo.present_str, 0, sizeof(topo.present_str));
 
-    int fd = open("/sys/devices/system/cpu/present", O_RDONLY);
-    if (fd != -1) {
-        char buf[64] = {0};
-        ssize_t n = read(fd, buf, sizeof(buf) - 1);
-        if (n > 0) {
-            char* p = strtrim(buf);
-            char* end = strchr(p, '\n');
-            if (end) *end = '\0';
-            strncpy(topo.present_str, p, sizeof(topo.present_str)-1);
-            topo.present_str[sizeof(topo.present_str)-1] = '\0';
-            parse_cpu_ranges(topo.present_str, &topo.present_cpus, NULL);
-        }
-        close(fd);
+    if (read_file(AT_FDCWD, "/sys/devices/system/cpu/present", topo.present_str, sizeof(topo.present_str))) {
+        strtrim(topo.present_str);
+    }
+    parse_cpu_ranges(topo.present_str, &topo.present_cpus, NULL);
+
+    if (access("/dev/cpuset", F_OK) != 0) return topo;
+
+    if (create_cpuset_dir(BASE_CPUSET, topo.present_str, "0")) {
+        topo.base_cpuset_fd = open(BASE_CPUSET, O_RDONLY | O_DIRECTORY);
+        if (topo.base_cpuset_fd != -1) topo.cpuset_enabled = true;
     }
 
-    if (access("/dev/cpuset", F_OK) != 0) {
-        return topo;
+    char mems_path[256];
+    snprintf(mems_path, sizeof(mems_path), "%s/mems", BASE_CPUSET);
+    if (!read_file(AT_FDCWD, mems_path, topo.mems_str, sizeof(topo.mems_str))) {
+        strcpy(topo.mems_str, "0");
+    } else {
+        strtrim(topo.mems_str);
     }
-    const char* cpuset_dir = "/dev/cpuset/AppOpt";
-    if (mkdir(cpuset_dir, 0755) != 0) {
-        struct stat st;
-        if (stat(cpuset_dir, &st) != 0 || !S_ISDIR(st.st_mode)) {
-            return topo;
-        }
-    }
-
-    chmod(cpuset_dir, 0755);
-    chown(cpuset_dir, 0, 0);
-
-    int cpus_fd = open("/dev/cpuset/AppOpt/cpus", O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    if (cpus_fd == -1) {
-        return topo;
-    }
-    if (dprintf(cpus_fd, "%s", topo.present_str) < 0) {
-        close(cpus_fd);
-        return topo;
-    }
-    close(cpus_fd);
-
-    int mems_fd = open("/dev/cpuset/AppOpt/mems", O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    if (mems_fd == -1) {
-        return topo;
-    }
-    if (write(mems_fd, "0", 1) != 1) {
-        close(mems_fd);
-        return topo;
-    }
-    close(mems_fd);
-    topo.cpuset_enabled = true;
 
     return topo;
 }
 
 static bool load_config(AppConfig* cfg) {
     struct stat st;
-    if (stat(CONFIG_FILE, &st) != 0) {
-        FILE* fp = fopen(CONFIG_FILE, "w");
-        if (!fp) return false;
-        fclose(fp);
+    if (stat(cfg->config_file, &st) != 0) {
+        const char* initial_content = "# 规则编写与使用说明请参考 http://AppOpt.suto.top\n\n";
+        if (write_file(AT_FDCWD, cfg->config_file, initial_content, O_WRONLY | O_CREAT | O_TRUNC)) {
+            cfg->mtime = 0;
+        }
         return false;
     }
 
     if (st.st_mtime <= cfg->mtime) return false;
-
-    FILE* fp = fopen(CONFIG_FILE, "r");
+    FILE* fp = fopen(cfg->config_file, "r");
     if (!fp) return false;
 
     AffinityRule* new_rules = NULL;
     char** new_pkgs = NULL;
-    size_t count = 0, pkgs_count = 0;
+    size_t rules_cnt = 0, pkgs_cnt = 0;
     char line[256];
 
     while (fgets(line, sizeof(line), fp)) {
@@ -243,119 +275,142 @@ static bool load_config(AppConfig* cfg) {
 
         char* pkg = strtrim(p);
         char* cpus = strtrim(eq);
-        if (strlen(pkg) >= MAX_PKG_LEN || strlen(thread) >= MAX_THREAD_LEN)
+        if (strlen(pkg) >= MAX_PKG_LEN || strlen(thread) >= MAX_THREAD_LEN) continue;
+
+        cpu_set_t set;
+        CPU_ZERO(&set);
+        parse_cpu_ranges(cpus, &set, &cfg->topo.present_cpus);
+        if (CPU_COUNT(&set) == 0) continue;
+
+        char* dir_name = cpu_set_to_str(&set);
+        if (!dir_name) continue;
+
+        char path[256];
+        snprintf(path, sizeof(path), "%s/%s", BASE_CPUSET, dir_name);
+        if (!create_cpuset_dir(path, dir_name, cfg->topo.mems_str)) {
+            free(dir_name);
             continue;
+        }
 
         AffinityRule rule = {0};
-        strncpy(rule.pkg, pkg, sizeof(rule.pkg) - 1);
-        rule.pkg[sizeof(rule.pkg)-1] = '\0';
-        strncpy(rule.thread, thread, sizeof(rule.thread) - 1);
-        rule.thread[sizeof(rule.thread)-1] = '\0';
-        parse_cpu_ranges(cpus, &rule.cpus, &cfg->topo.present_cpus);
-        bool pkg_exists = false;
-        for (size_t i = 0; i < pkgs_count; i++) {
-            if (strcmp(new_pkgs[i], pkg) == 0) {
-                pkg_exists = true;
-                break;
+        strncpy(rule.pkg, pkg, MAX_PKG_LEN - 1);
+        rule.pkg[MAX_PKG_LEN - 1] = '\0';
+        strncpy(rule.thread, thread, MAX_THREAD_LEN - 1);
+        rule.thread[MAX_THREAD_LEN - 1] = '\0';
+        strncpy(rule.cpuset_dir, dir_name, sizeof(rule.cpuset_dir) - 1);
+        rule.cpuset_dir[sizeof(rule.cpuset_dir) - 1] = '\0';
+        rule.cpus = set;
+        free(dir_name);
+
+        AffinityRule* tmp_rules = realloc(new_rules, (rules_cnt + 1) * sizeof(AffinityRule));
+        if (!tmp_rules) goto error;
+        new_rules = tmp_rules;
+        memcpy(&new_rules[rules_cnt], &rule, sizeof(AffinityRule));
+        rules_cnt++;
+
+        bool exists = false;
+        if (new_pkgs != NULL) {
+            for (size_t i = 0; i < pkgs_cnt; i++) {
+                if (strcmp(new_pkgs[i], pkg) == 0) {
+                    exists = true;
+                    break;
+                }
             }
         }
-        if (!pkg_exists) {
-            char** tmp = realloc(new_pkgs, (pkgs_count+1)*sizeof(char*));
-            if (!tmp) goto error;
-            new_pkgs = tmp;
-            new_pkgs[pkgs_count] = strdup(pkg);
-            if (!new_pkgs[pkgs_count]) goto error;
-            pkgs_count++;
+        if (!exists) {
+            char** tmp_pkgs = realloc(new_pkgs, (pkgs_cnt + 1) * sizeof(char*));
+            if (!tmp_pkgs) goto error;
+            new_pkgs = tmp_pkgs;
+            new_pkgs[pkgs_cnt] = strdup(pkg);
+            if (!new_pkgs[pkgs_cnt]) goto error;
+            pkgs_cnt++;
         }
-        AffinityRule* tmp = realloc(new_rules, (count+1)*sizeof(AffinityRule));
-        if (!tmp) goto error;
-        new_rules = tmp;
-        new_rules[count++] = rule;
     }
 
-    if (count == 0) goto error;
     free(cfg->rules);
-    for (size_t i = 0; i < cfg->num_pkgs; i++) free(cfg->pkgs[i]);
-    free(cfg->pkgs);
+    if (cfg->pkgs != NULL) {
+        for (size_t i = 0; i < cfg->num_pkgs; i++) free(cfg->pkgs[i]);
+        free(cfg->pkgs);
+    }
 
     cfg->rules = new_rules;
-    cfg->num_rules = count;
+    cfg->num_rules = rules_cnt;
     cfg->pkgs = new_pkgs;
-    cfg->num_pkgs = pkgs_count;
-
+    cfg->num_pkgs = pkgs_cnt;
     cfg->mtime = st.st_mtime;
+
     fclose(fp);
+    printf("Config file loaded, Total of %zu rules.\n", rules_cnt);
     return true;
 
 error:
     free(new_rules);
-    for (size_t i = 0; i < pkgs_count; i++) free(new_pkgs[i]);
-    free(new_pkgs);
+    if (new_pkgs != NULL) {
+        for (size_t i = 0; i < pkgs_cnt; i++) free(new_pkgs[i]);
+        free(new_pkgs);
+    }
     fclose(fp);
     return false;
 }
 
-static ProcCache* update_proc_cache(ProcCache* cache, const AppConfig* cfg) {
-    time_t now = time(NULL);
-    if (now - cache->last_update < PROC_CACHE_TIME) return cache;
-
+static ProcessInfo* proc_collect(const AppConfig* cfg, size_t* count) {
     DIR* proc_dir = opendir("/proc");
-    if (!proc_dir) return cache;
+    if (!proc_dir) return NULL;
+    int proc_fd = dirfd(proc_dir);
     size_t proc_cap = 2048;
     ProcessInfo* new_procs = malloc(proc_cap * sizeof(ProcessInfo));
     if (!new_procs) {
         closedir(proc_dir);
-        return cache;
+        return NULL;
     }
-    size_t count = 0;
-    int proc_fd = dirfd(proc_dir);
+    *count = 0;
     struct dirent* ent;
 
     while ((ent = readdir(proc_dir))) {
-        if (ent->d_type != DT_DIR || !isdigit(ent->d_name[0]))
-            continue;
+        if (ent->d_type != DT_DIR || !isdigit(ent->d_name[0])) continue;
 
-        pid_t pid = atoi(ent->d_name);
+        char* endptr;
+        unsigned long pid_ul = strtoul(ent->d_name, &endptr, 10);
+        if (*endptr != '\0') continue;
+        pid_t pid = (pid_t)pid_ul;
+
         int pid_fd = openat(proc_fd, ent->d_name, O_RDONLY | O_DIRECTORY);
         if (pid_fd == -1) continue;
 
         char cmd[MAX_PKG_LEN] = {0};
-        int cmd_fd = openat(pid_fd, "cmdline", O_RDONLY);
-        if (cmd_fd == -1) {
+        if (!read_file(pid_fd, "cmdline", cmd, sizeof(cmd))) {
             close(pid_fd);
             continue;
         }
 
-        ssize_t n = read(cmd_fd, cmd, sizeof(cmd) - 1);
-        close(cmd_fd);
-        if (n <= 0) {
-            close(pid_fd);
-            continue;
-        }
-
-        cmd[n] = '\0';
         char* name = strrchr(cmd, '/');
         name = name ? name + 1 : cmd;
-        bool found_pkg = false;
+
+        bool found = false;
         for (size_t j = 0; j < cfg->num_pkgs; j++) {
             if (strcmp(name, cfg->pkgs[j]) == 0) {
-                found_pkg = true;
+                found = true;
                 break;
             }
         }
-        if (!found_pkg) {
+        if (!found) {
             close(pid_fd);
             continue;
         }
 
         ProcessInfo proc = {0};
         proc.pid = pid;
-        strncpy(proc.pkg, name, sizeof(proc.pkg) - 1);
-        proc.pkg[sizeof(proc.pkg)-1] = '\0';
+        strncpy(proc.pkg, name, MAX_PKG_LEN - 1);
+        proc.pkg[MAX_PKG_LEN - 1] = '\0';
         CPU_ZERO(&proc.base_cpus);
+        proc.base_cpuset[0] = '\0';
 
         size_t thrules_cap = 4;
         proc.thread_rules = malloc(thrules_cap * sizeof(AffinityRule*));
+        if (!proc.thread_rules) {
+            close(pid_fd);
+            continue;
+        }
         proc.num_thread_rules = 0;
 
         for (size_t i = 0; i < cfg->num_rules; i++) {
@@ -365,18 +420,19 @@ static ProcCache* update_proc_cache(ProcCache* cache, const AppConfig* cfg) {
             if (rule->thread[0]) {
                 if (proc.num_thread_rules >= thrules_cap) {
                     thrules_cap *= 2;
-                    AffinityRule** tmp = realloc(proc.thread_rules,
-                        thrules_cap * sizeof(AffinityRule*));
+                    AffinityRule** tmp = realloc(proc.thread_rules, thrules_cap * sizeof(AffinityRule*));
                     if (!tmp) break;
                     proc.thread_rules = tmp;
                 }
                 proc.thread_rules[proc.num_thread_rules++] = (AffinityRule*)rule;
             } else {
                 CPU_OR(&proc.base_cpus, &proc.base_cpus, &rule->cpus);
+                strncpy(proc.base_cpuset, rule->cpuset_dir, sizeof(proc.base_cpuset) - 1);
+                proc.base_cpuset[sizeof(proc.base_cpuset) - 1] = '\0';
             }
         }
 
-        if (proc.num_thread_rules == 0 && CPU_COUNT(&proc.base_cpus) == 0) {
+        if (CPU_COUNT(&proc.base_cpus) == 0 && proc.num_thread_rules == 0) {
             close(pid_fd);
             free(proc.thread_rules);
             continue;
@@ -398,35 +454,47 @@ static ProcCache* update_proc_cache(ProcCache* cache, const AppConfig* cfg) {
 
         size_t thread_cap = 128;
         ThreadInfo* threads = malloc(thread_cap * sizeof(ThreadInfo));
+        if (!threads) {
+            closedir(task_dir);
+            free(proc.thread_rules);
+            continue;
+        }
         size_t tcount = 0;
         struct dirent* tent;
 
         while ((tent = readdir(task_dir))) {
-            if (tent->d_type != DT_DIR || !isdigit(tent->d_name[0]))
-                continue;
+            if (tent->d_type != DT_DIR || !isdigit(tent->d_name[0])) continue;
 
-            pid_t tid = atoi(tent->d_name);
+            char* endptr2;
+            unsigned long tid_ul = strtoul(tent->d_name, &endptr2, 10);
+            if (*endptr2 != '\0') continue;
+            pid_t tid = (pid_t)tid_ul;
+
             char tname[MAX_THREAD_LEN] = {0};
 
             int tid_fd = openat(task_fd, tent->d_name, O_RDONLY | O_DIRECTORY);
             if (tid_fd == -1) continue;
 
-            int comm_fd = openat(tid_fd, "comm", O_RDONLY);
+            if (!read_file(tid_fd, "comm", tname, sizeof(tname))) {
+                close(tid_fd);
+                continue;
+            }
             close(tid_fd);
-            if (comm_fd == -1) continue;
 
-            ssize_t n = read(comm_fd, tname, sizeof(tname) - 1);
-            close(comm_fd);
-            if (n <= 0) continue;
-
-            tname[n] = '\0';
             strtrim(tname);
+            ThreadInfo ti = { .tid = tid };
+            strncpy(ti.name, tname, MAX_THREAD_LEN - 1);
+            ti.name[MAX_THREAD_LEN - 1] = '\0';
+            ti.cpus = proc.base_cpus;
+            strncpy(ti.cpuset_dir, proc.base_cpuset, sizeof(ti.cpuset_dir) - 1);
+            ti.cpuset_dir[sizeof(ti.cpuset_dir) - 1] = '\0';
 
-            cpu_set_t mask;
-            CPU_ZERO(&mask);
             for (size_t i = 0; i < proc.num_thread_rules; i++) {
-                if (fnmatch(proc.thread_rules[i]->thread, tname, FNM_NOESCAPE) == 0) {
-                    CPU_OR(&mask, &mask, &proc.thread_rules[i]->cpus);
+                const AffinityRule* rule = proc.thread_rules[i];
+                if (fnmatch(rule->thread, ti.name, FNM_NOESCAPE) == 0) {
+                    CPU_OR(&ti.cpus, &ti.cpus, &rule->cpus);
+                    strncpy(ti.cpuset_dir, rule->cpuset_dir, sizeof(ti.cpuset_dir) - 1);
+                    ti.cpuset_dir[sizeof(ti.cpuset_dir) - 1] = '\0';
                 }
             }
 
@@ -436,113 +504,164 @@ static ProcCache* update_proc_cache(ProcCache* cache, const AppConfig* cfg) {
                 if (!tmp) continue;
                 threads = tmp;
             }
-
-            ThreadInfo ti = {
-                .tid = tid,
-                .cpus = CPU_COUNT(&mask) ? mask : proc.base_cpus
-            };
-            strncpy(ti.name, tname, sizeof(ti.name) - 1);
-            ti.name[sizeof(ti.name)-1] = '\0';
             threads[tcount++] = ti;
         }
 
         proc.threads = threads;
         proc.num_threads = tcount;
 
-        if (count >= proc_cap) {
+        if (*count >= proc_cap) {
             proc_cap *= 2;
             ProcessInfo* tmp = realloc(new_procs, proc_cap * sizeof(ProcessInfo));
             if (!tmp) {
                 free(threads);
                 free(proc.thread_rules);
                 closedir(task_dir);
-                break;
+                continue;
             }
             new_procs = tmp;
         }
-        new_procs[count++] = proc;
+        new_procs[(*count)++] = proc;
         closedir(task_dir);
     }
     closedir(proc_dir);
-    if (cache->procs) {
-        for (size_t i = 0; i < cache->num_procs; i++) {
-            free(cache->procs[i].threads);
-            free(cache->procs[i].thread_rules);
-        }
-        free(cache->procs);
-    }
-
-    cache->procs = new_procs;
-    cache->num_procs = count;
-    cache->last_update = now;
-    return cache;
+    return new_procs;
 }
 
-static bool apply_affinity(const ProcessInfo* proc, const CpuTopology* topo) {
-    bool applied = false;
+static int get_proc_count(void) {
+    char buf[64];
+    if (!read_file(AT_FDCWD, "/proc/loadavg", buf, sizeof(buf))) return -1;
+    char *pos = buf, *slash;
+    for (int i = 0; i < 3; i++) {
+        pos = strchr(pos, ' ');
+        if (!pos) return -1;
+        pos++;
+    }
+    slash = strchr(pos, '/');
+    if (!slash || slash == pos) return -1;
 
-    for (size_t i = 0; i < proc->num_threads; i++) {
-        const ThreadInfo* ti = &proc->threads[i];
-        cpu_set_t curr;
-        CPU_ZERO(&curr);
+    char *endptr;
+    (void)strtoul(pos, &endptr, 10);
+    if (endptr != slash) return -1;
+    unsigned long total = strtoul(slash + 1, &endptr, 10);
+    if (*endptr != ' ' && *endptr != '\0') return -1;
 
-        if (sched_getaffinity(ti->tid, sizeof(curr), &curr) == -1)
-            continue;
+    return (int)total;
+}
 
-        if (!CPU_EQUAL(&ti->cpus, &curr)) {
-            if (topo->cpuset_enabled) {
-                int fd = open("/dev/cpuset/AppOpt/tasks", O_WRONLY | O_APPEND);
-                if (fd != -1) {
-                    dprintf(fd, "%d\n", ti->tid);
-                    close(fd);
+static void update_cache(ProcCache* cache, const AppConfig* cfg, int* affinity_counter) {
+    int current_proc_count = get_proc_count();
+    if (current_proc_count == -1) return;
+    if (current_proc_count > cache->last_proc_count + 5) {
+        size_t count;
+        ProcessInfo* new_procs = proc_collect(cfg, &count);
+        if (!new_procs) return;
+
+        if (cache->procs) {
+            for (size_t i = 0; i < cache->num_procs; i++) {
+                free(cache->procs[i].threads);
+                free(cache->procs[i].thread_rules);
+            }
+            free(cache->procs);
+        }
+        cache->procs = new_procs;
+        cache->num_procs = count;
+        *affinity_counter = 9;
+    }
+    cache->last_proc_count = current_proc_count;
+}
+
+static void apply_affinity(ProcCache* cache, const CpuTopology* topo) {
+    for (size_t i = 0; i < cache->num_procs; i++) {
+        const ProcessInfo* proc = &cache->procs[i];
+        for (size_t j = 0; j < proc->num_threads; j++) {
+            const ThreadInfo* ti = &proc->threads[j];
+            if (topo->cpuset_enabled && topo->base_cpuset_fd != -1) {
+                char tid_str[32];
+                snprintf(tid_str, sizeof(tid_str), "%d\n", ti->tid);
+                if (CPU_COUNT(&ti->cpus) == 0) {
+                    write_file(topo->base_cpuset_fd, "tasks", tid_str, O_WRONLY | O_APPEND);
+                } else {
+                    if (ti->cpuset_dir[0]) {
+                        int fd = openat(topo->base_cpuset_fd, ti->cpuset_dir, O_RDONLY | O_DIRECTORY);
+                        if (fd != -1) {
+                            write_file(fd, "tasks", tid_str, O_WRONLY | O_APPEND);
+                            close(fd);
+                        }
+                    }
                 }
             }
-            if (sched_setaffinity(ti->tid, sizeof(ti->cpus), &ti->cpus) == 0) {
-                applied = true;
+            if (CPU_COUNT(&ti->cpus) == 0) continue;
+            if (sched_setaffinity(ti->tid, sizeof(ti->cpus), &ti->cpus) == -1 && errno == ESRCH) {
+                cache->last_proc_count = 0;
             }
         }
     }
-    return applied;
 }
 
-int main(void) {
+static void print_help(const char* prog_name) {
+    printf("Usage: %s [OPTIONS]\n", prog_name);
+    printf("Options:\n");
+    printf("  -c <config_file>    Specify configuration file (default: ./applist.conf)\n");
+    printf("  -s <interval>       Set sleep interval in seconds (must be >=1, default: 3)\n");
+    printf("  -h                  Display this help message\n");
+    printf("\nExample:\n");
+    printf("  %s -c /data/applist.conf -s 3\n", prog_name);
+}
+
+int main(int argc, char **argv) {
     AppConfig config = { .topo = init_cpu_topo() };
+    strncpy(config.config_file, "./applist.conf", sizeof(config.config_file) -1);
+    config.config_file[sizeof(config.config_file)-1] = '\0';
+    int sleep_interval = 3;
+
+    int opt;
+    while ((opt = getopt(argc, argv, "c:s:h")) != -1) {
+        switch (opt) {
+            case 'c':
+                strncpy(config.config_file, optarg, sizeof(config.config_file)-1);
+                config.config_file[sizeof(config.config_file)-1] = '\0';
+                printf("Config file: %s\n", config.config_file);
+                break;
+            case 's':
+            {
+                char *endptr;
+                long val = strtol(optarg, &endptr, 10);
+                if (endptr == optarg || *endptr != '\0' || val < 1) {
+                    fprintf(stderr, "Invalid interval value: %s\n", optarg);
+                    fprintf(stderr, "Interval must be an integer >=1\n");
+                    exit(EXIT_FAILURE);
+                }
+                sleep_interval = (int)val;
+                printf("Sleep interval: %d s\n", sleep_interval);
+                break;
+            }
+            case 'h':
+                print_help(argv[0]);
+                exit(EXIT_SUCCESS);
+            default:
+                print_help(argv[0]);
+                exit(EXIT_FAILURE);
+        }
+    }
+
     ProcCache cache = {0};
-    time_t last_config_check = 0;
-    time_t last_affinity_time = 0;
+    int config_counter = 9;
+    int affinity_counter = 9;
+    printf("Start AppOpt service.\n");
 
     for (;;) {
-        if (!is_screen_on()) {
-            nanosleep(&(struct timespec){12, 0}, NULL);
-            cache.last_update = 0;
-            continue;
+        config_counter++;
+        if (config_counter > 3) {
+            if (load_config(&config)) cache.last_proc_count = 0;
+            config_counter = 0;
         }
-
-        const time_t now = time(NULL);
-        if (now - last_config_check >= 15) {
-            if (load_config(&config)) {
-                cache.last_update = 0;
-            }
-            last_config_check = now;
+        update_cache(&cache, &config, &affinity_counter);
+        affinity_counter++;
+        if (affinity_counter > 3) {
+            apply_affinity(&cache, &config.topo);
+            affinity_counter = 0;
         }
-
-        update_proc_cache(&cache, &config);
-
-        bool applied = false;
-        for (size_t i = 0; i < cache.num_procs; i++) {
-            applied |= apply_affinity(&cache.procs[i], &config.topo);
-        }
-        if (applied) last_affinity_time = now;
-
-        struct timespec delay;
-        if (now - last_affinity_time <= 6) {
-            delay.tv_sec = 1;
-            delay.tv_nsec = 0;
-        } else {
-            delay.tv_sec = 3;
-            delay.tv_nsec = 0;
-        }
-        nanosleep(&delay, NULL);
+        sleep(sleep_interval);
     }
-    return 0;
 }
