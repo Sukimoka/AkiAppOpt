@@ -613,7 +613,7 @@ int main(int argc, char **argv) {
     AppConfig config = { .topo = init_cpu_topo() };
     strncpy(config.config_file, "./applist.conf", sizeof(config.config_file) -1);
     config.config_file[sizeof(config.config_file)-1] = '\0';
-    int sleep_interval = 3;
+    int sleep_interval = 2;
 
     int opt;
     while ((opt = getopt(argc, argv, "c:s:h")) != -1) {
