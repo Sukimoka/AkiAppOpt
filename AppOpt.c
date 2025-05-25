@@ -9,9 +9,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/sysinfo.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
+#define VERSION            "1.3.2"
 #define BASE_CPUSET        "/dev/cpuset/AppOpt"
 #define MAX_PKG_LEN        128
 #define MAX_THREAD_LEN     32
@@ -78,39 +80,40 @@ static char* strtrim(char* s) {
 static bool read_file(int dir_fd, const char* filename, char* buf, size_t buf_size) {
     int fd = openat(dir_fd, filename, O_RDONLY | O_CLOEXEC);
     if (fd == -1) return false;
-    ssize_t total = 0;
-    while (total < (ssize_t)(buf_size - 1)) {
-        ssize_t n = read(fd, buf + total, buf_size - 1 - total);
-        if (n == -1) {
-            if (errno == EINTR) continue;
-            break;
-        }
-        if (n == 0) break;
-        total += n;
-    }
+    ssize_t n = read(fd, buf, buf_size - 1);
     close(fd);
-    if (total <= 0) return false;
-    buf[total] = '\0';
+    if (n <= 0) return false;
+    buf[n] = '\0';
     return true;
 }
 
 static bool write_file(int dir_fd, const char* filename, const char* content, int flags) {
     int fd = openat(dir_fd, filename, flags | O_CLOEXEC, 0644);
     if (fd == -1) return false;
-    const char* ptr = content;
-    size_t remaining = strlen(content);
-    while (remaining > 0) {
-        ssize_t n = write(fd, ptr, remaining);
-        if (n == -1) {
-            if (errno == EINTR) continue;
-            close(fd);
-            return false;
-        }
-        ptr += n;
-        remaining -= n;
-    }
+    ssize_t n = write(fd, content, strlen(content));
     close(fd);
-    return true;
+    return (n == (ssize_t)strlen(content));
+}
+
+static int build_str(char *dest, size_t dest_size, ...) {
+    va_list args;
+    const char *segment;
+    char *p = dest;
+    size_t remaining = dest_size - 1;
+    va_start(args, dest_size);
+    while ((segment = va_arg(args, const char *)) != NULL) {
+        size_t len = strlen(segment);
+        if (len > remaining) {
+            va_end(args);
+            return 0;
+        }
+        memcpy(p, segment, len);
+        p += len;
+        remaining -= len;
+    }
+    *p = '\0';
+    va_end(args);
+    return 1;
 }
 
 static void parse_cpu_ranges(const char* spec, cpu_set_t* set, const cpu_set_t* present) {
@@ -201,11 +204,11 @@ static bool create_cpuset_dir(const char *path, const char *cpus, const char *me
     if (chown(path, 0, 0) != 0) return false;
 
     char cpus_path[256];
-    snprintf(cpus_path, sizeof(cpus_path), "%s/cpus", path);
+    build_str(cpus_path, sizeof(cpus_path), path, "/cpus", NULL);
     if (!write_file(AT_FDCWD, cpus_path, cpus, O_WRONLY | O_CREAT | O_TRUNC)) return false;
 
     char mems_path[256];
-    snprintf(mems_path, sizeof(mems_path), "%s/mems", path);
+    build_str(mems_path, sizeof(mems_path), path, "/mems", NULL);
     return write_file(AT_FDCWD, mems_path, mems, O_WRONLY | O_CREAT | O_TRUNC);
 }
 
@@ -226,7 +229,7 @@ static CpuTopology init_cpu_topo(void) {
     }
 
     char mems_path[256];
-    snprintf(mems_path, sizeof(mems_path), "%s/mems", BASE_CPUSET);
+    build_str(mems_path, sizeof(mems_path), BASE_CPUSET, "/mems", NULL);
     if (!read_file(AT_FDCWD, mems_path, topo.mems_str, sizeof(topo.mems_str))) {
         strcpy(topo.mems_str, "0");
     } else {
@@ -286,19 +289,16 @@ static bool load_config(AppConfig* cfg) {
         if (!dir_name) continue;
 
         char path[256];
-        snprintf(path, sizeof(path), "%s/%s", BASE_CPUSET, dir_name);
+        build_str(path, sizeof(path), BASE_CPUSET, "/", dir_name, NULL);
         if (!create_cpuset_dir(path, dir_name, cfg->topo.mems_str)) {
             free(dir_name);
             continue;
         }
 
         AffinityRule rule = {0};
-        strncpy(rule.pkg, pkg, MAX_PKG_LEN - 1);
-        rule.pkg[MAX_PKG_LEN - 1] = '\0';
-        strncpy(rule.thread, thread, MAX_THREAD_LEN - 1);
-        rule.thread[MAX_THREAD_LEN - 1] = '\0';
-        strncpy(rule.cpuset_dir, dir_name, sizeof(rule.cpuset_dir) - 1);
-        rule.cpuset_dir[sizeof(rule.cpuset_dir) - 1] = '\0';
+        build_str(rule.pkg, sizeof(rule.pkg), pkg, NULL);
+        build_str(rule.thread, sizeof(rule.thread), thread, NULL);
+        build_str(rule.cpuset_dir, sizeof(rule.cpuset_dir), dir_name, NULL);
         rule.cpus = set;
         free(dir_name);
 
@@ -373,7 +373,6 @@ static ProcessInfo* proc_collect(const AppConfig* cfg, size_t* count) {
         unsigned long pid_ul = strtoul(ent->d_name, &endptr, 10);
         if (*endptr != '\0') continue;
         pid_t pid = (pid_t)pid_ul;
-
         int pid_fd = openat(proc_fd, ent->d_name, O_RDONLY | O_DIRECTORY);
         if (pid_fd == -1) continue;
 
@@ -382,7 +381,6 @@ static ProcessInfo* proc_collect(const AppConfig* cfg, size_t* count) {
             close(pid_fd);
             continue;
         }
-
         char* name = strrchr(cmd, '/');
         name = name ? name + 1 : cmd;
 
@@ -400,12 +398,11 @@ static ProcessInfo* proc_collect(const AppConfig* cfg, size_t* count) {
 
         ProcessInfo proc = {0};
         proc.pid = pid;
-        strncpy(proc.pkg, name, MAX_PKG_LEN - 1);
-        proc.pkg[MAX_PKG_LEN - 1] = '\0';
+        build_str(proc.pkg, sizeof(proc.pkg), name, NULL);
         CPU_ZERO(&proc.base_cpus);
         proc.base_cpuset[0] = '\0';
 
-        size_t thrules_cap = 4;
+        size_t thrules_cap = 8;
         proc.thread_rules = malloc(thrules_cap * sizeof(AffinityRule*));
         if (!proc.thread_rules) {
             close(pid_fd);
@@ -427,8 +424,7 @@ static ProcessInfo* proc_collect(const AppConfig* cfg, size_t* count) {
                 proc.thread_rules[proc.num_thread_rules++] = (AffinityRule*)rule;
             } else {
                 CPU_OR(&proc.base_cpus, &proc.base_cpus, &rule->cpus);
-                strncpy(proc.base_cpuset, rule->cpuset_dir, sizeof(proc.base_cpuset) - 1);
-                proc.base_cpuset[sizeof(proc.base_cpuset) - 1] = '\0';
+                build_str(proc.base_cpuset, sizeof(proc.base_cpuset), rule->cpuset_dir, NULL);
             }
         }
 
@@ -452,7 +448,7 @@ static ProcessInfo* proc_collect(const AppConfig* cfg, size_t* count) {
             continue;
         }
 
-        size_t thread_cap = 128;
+        size_t thread_cap = 256;
         ThreadInfo* threads = malloc(thread_cap * sizeof(ThreadInfo));
         if (!threads) {
             closedir(task_dir);
@@ -483,18 +479,15 @@ static ProcessInfo* proc_collect(const AppConfig* cfg, size_t* count) {
 
             strtrim(tname);
             ThreadInfo ti = { .tid = tid };
-            strncpy(ti.name, tname, MAX_THREAD_LEN - 1);
-            ti.name[MAX_THREAD_LEN - 1] = '\0';
+            build_str(ti.name, sizeof(ti.name), tname, NULL);
             ti.cpus = proc.base_cpus;
-            strncpy(ti.cpuset_dir, proc.base_cpuset, sizeof(ti.cpuset_dir) - 1);
-            ti.cpuset_dir[sizeof(ti.cpuset_dir) - 1] = '\0';
+            build_str(ti.cpuset_dir, sizeof(ti.cpuset_dir), proc.base_cpuset, NULL);
 
             for (size_t i = 0; i < proc.num_thread_rules; i++) {
                 const AffinityRule* rule = proc.thread_rules[i];
                 if (fnmatch(rule->thread, ti.name, FNM_NOESCAPE) == 0) {
                     CPU_OR(&ti.cpus, &ti.cpus, &rule->cpus);
-                    strncpy(ti.cpuset_dir, rule->cpuset_dir, sizeof(ti.cpuset_dir) - 1);
-                    ti.cpuset_dir[sizeof(ti.cpuset_dir) - 1] = '\0';
+                    build_str(ti.cpuset_dir, sizeof(ti.cpuset_dir), rule->cpuset_dir, NULL);
                 }
             }
 
@@ -528,35 +521,32 @@ static ProcessInfo* proc_collect(const AppConfig* cfg, size_t* count) {
     return new_procs;
 }
 
-static int get_proc_count(void) {
-    char buf[64];
-    if (!read_file(AT_FDCWD, "/proc/loadavg", buf, sizeof(buf))) return -1;
-    char *pos = buf, *slash;
-    for (int i = 0; i < 3; i++) {
-        pos = strchr(pos, ' ');
-        if (!pos) return -1;
-        pos++;
-    }
-    slash = strchr(pos, '/');
-    if (!slash || slash == pos) return -1;
-
-    char *endptr;
-    (void)strtoul(pos, &endptr, 10);
-    if (endptr != slash) return -1;
-    unsigned long total = strtoul(slash + 1, &endptr, 10);
-    if (*endptr != ' ' && *endptr != '\0') return -1;
-
-    return (int)total;
-}
-
 static void update_cache(ProcCache* cache, const AppConfig* cfg, int* affinity_counter) {
-    int current_proc_count = get_proc_count();
-    if (current_proc_count == -1) return;
-    if (current_proc_count > cache->last_proc_count + 5) {
+    bool need_reload = false;
+    struct sysinfo info;
+    if (sysinfo(&info) != 0) {
+        need_reload = true;
+    } else {
+        int current_proc_count = info.procs;
+        if (current_proc_count > cache->last_proc_count + 15) {
+            need_reload = true;
+        } else if (current_proc_count > cache->last_proc_count) {
+            *affinity_counter = 0;
+        }
+        cache->last_proc_count = current_proc_count;
+    }
+    if (cache->procs != NULL && !need_reload) {
+        for (size_t i = 0; i < cache->num_procs; i++) {
+            if (kill(cache->procs[i].pid, 0) != 0) {
+                need_reload = true;
+                break;
+            }
+        }
+    }
+    if (need_reload) {
         size_t count;
         ProcessInfo* new_procs = proc_collect(cfg, &count);
         if (!new_procs) return;
-
         if (cache->procs) {
             for (size_t i = 0; i < cache->num_procs; i++) {
                 free(cache->procs[i].threads);
@@ -566,9 +556,8 @@ static void update_cache(ProcCache* cache, const AppConfig* cfg, int* affinity_c
         }
         cache->procs = new_procs;
         cache->num_procs = count;
-        *affinity_counter = 9;
+        *affinity_counter = 0;
     }
-    cache->last_proc_count = current_proc_count;
 }
 
 static void apply_affinity(ProcCache* cache, const CpuTopology* topo) {
@@ -602,25 +591,24 @@ static void apply_affinity(ProcCache* cache, const CpuTopology* topo) {
 static void print_help(const char* prog_name) {
     printf("Usage: %s [OPTIONS]\n", prog_name);
     printf("Options:\n");
-    printf("  -c <config_file>    Specify configuration file (default: ./applist.conf)\n");
-    printf("  -s <interval>       Set sleep interval in seconds (must be >=1, default: 3)\n");
-    printf("  -h                  Display this help message\n");
+    printf("  -c <config_file>   Specify configuration file (default: ./applist.conf)\n");
+    printf("  -s <interval>      Set sleep interval in seconds (must be >=1, default: 2)\n");
+    printf("  -v                 Display program version\n");
+    printf("  -h                 Display this help message\n");
     printf("\nExample:\n");
     printf("  %s -c /data/applist.conf -s 3\n", prog_name);
 }
 
 int main(int argc, char **argv) {
     AppConfig config = { .topo = init_cpu_topo() };
-    strncpy(config.config_file, "./applist.conf", sizeof(config.config_file) -1);
-    config.config_file[sizeof(config.config_file)-1] = '\0';
+    build_str(config.config_file, sizeof(config.config_file), "./applist.conf", NULL);
     int sleep_interval = 2;
 
     int opt;
-    while ((opt = getopt(argc, argv, "c:s:h")) != -1) {
+    while ((opt = getopt(argc, argv, "c:s:hv")) != -1) {
         switch (opt) {
             case 'c':
-                strncpy(config.config_file, optarg, sizeof(config.config_file)-1);
-                config.config_file[sizeof(config.config_file)-1] = '\0';
+                build_str(config.config_file, sizeof(config.config_file), optarg, NULL);
                 printf("Config file: %s\n", config.config_file);
                 break;
             case 's':
@@ -636,6 +624,9 @@ int main(int argc, char **argv) {
                 printf("Sleep interval: %d s\n", sleep_interval);
                 break;
             }
+            case 'v':
+                printf("AppOpt version %s\n", VERSION);
+                exit(EXIT_SUCCESS);
             case 'h':
                 print_help(argv[0]);
                 exit(EXIT_SUCCESS);
@@ -646,21 +637,21 @@ int main(int argc, char **argv) {
     }
 
     ProcCache cache = {0};
-    int config_counter = 9;
-    int affinity_counter = 9;
+    int config_counter = 0;
+    int affinity_counter = 0;
     printf("Start AppOpt service.\n");
 
     for (;;) {
-        config_counter++;
-        if (config_counter > 3) {
+        config_counter--;
+        if (config_counter < 1) {
             if (load_config(&config)) cache.last_proc_count = 0;
-            config_counter = 0;
+            config_counter = 5;
         }
         update_cache(&cache, &config, &affinity_counter);
-        affinity_counter++;
-        if (affinity_counter > 3) {
+        affinity_counter--;
+        if (affinity_counter < 1) {
             apply_affinity(&cache, &config.topo);
-            affinity_counter = 0;
+            affinity_counter = 5;
         }
         sleep(sleep_interval);
     }
