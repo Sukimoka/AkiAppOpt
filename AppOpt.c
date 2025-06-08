@@ -13,7 +13,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-#define VERSION            "1.3.2"
+#define VERSION            "1.3.5"
 #define BASE_CPUSET        "/dev/cpuset/AppOpt"
 #define MAX_PKG_LEN        128
 #define MAX_THREAD_LEN     32
@@ -367,11 +367,10 @@ static ProcessInfo* proc_collect(const AppConfig* cfg, size_t* count) {
     struct dirent* ent;
 
     while ((ent = readdir(proc_dir))) {
-        if (ent->d_type != DT_DIR || !isdigit(ent->d_name[0])) continue;
+		if (!isdigit(ent->d_name[0])) continue;
 
         char* endptr;
         unsigned long pid_ul = strtoul(ent->d_name, &endptr, 10);
-        if (*endptr != '\0') continue;
         pid_t pid = (pid_t)pid_ul;
         int pid_fd = openat(proc_fd, ent->d_name, O_RDONLY | O_DIRECTORY);
         if (pid_fd == -1) continue;
@@ -459,11 +458,10 @@ static ProcessInfo* proc_collect(const AppConfig* cfg, size_t* count) {
         struct dirent* tent;
 
         while ((tent = readdir(task_dir))) {
-            if (tent->d_type != DT_DIR || !isdigit(tent->d_name[0])) continue;
+            if (!isdigit(tent->d_name[0])) continue;
 
             char* endptr2;
             unsigned long tid_ul = strtoul(tent->d_name, &endptr2, 10);
-            if (*endptr2 != '\0') continue;
             pid_t tid = (pid_t)tid_ul;
 
             char tname[MAX_THREAD_LEN] = {0};
@@ -480,15 +478,22 @@ static ProcessInfo* proc_collect(const AppConfig* cfg, size_t* count) {
             strtrim(tname);
             ThreadInfo ti = { .tid = tid };
             build_str(ti.name, sizeof(ti.name), tname, NULL);
-            ti.cpus = proc.base_cpus;
-            build_str(ti.cpuset_dir, sizeof(ti.cpuset_dir), proc.base_cpuset, NULL);
+            CPU_ZERO(&ti.cpus);
+            const char* matched = NULL;
 
             for (size_t i = 0; i < proc.num_thread_rules; i++) {
                 const AffinityRule* rule = proc.thread_rules[i];
                 if (fnmatch(rule->thread, ti.name, FNM_NOESCAPE) == 0) {
                     CPU_OR(&ti.cpus, &ti.cpus, &rule->cpus);
-                    build_str(ti.cpuset_dir, sizeof(ti.cpuset_dir), rule->cpuset_dir, NULL);
+                    matched = rule->cpuset_dir;
                 }
+            }
+
+            if (matched) {
+                build_str(ti.cpuset_dir, sizeof(ti.cpuset_dir), matched, NULL);
+            } else {
+                ti.cpus = proc.base_cpus;
+                build_str(ti.cpuset_dir, sizeof(ti.cpuset_dir), proc.base_cpuset, NULL);
             }
 
             if (tcount >= thread_cap) {
@@ -569,8 +574,14 @@ static void apply_affinity(ProcCache* cache, const CpuTopology* topo) {
                 char tid_str[32];
                 snprintf(tid_str, sizeof(tid_str), "%d\n", ti->tid);
                 if (CPU_COUNT(&ti->cpus) == 0) {
+                    cpu_set_t curr;
+                    if (sched_getaffinity(ti->tid, sizeof(curr), &curr) == -1) continue;
+                    if (CPU_EQUAL(&topo->present_cpus, &curr)) continue;
                     write_file(topo->base_cpuset_fd, "tasks", tid_str, O_WRONLY | O_APPEND);
                 } else {
+                    cpu_set_t curr;
+                    if (sched_getaffinity(ti->tid, sizeof(curr), &curr) == -1) continue;
+                    if (CPU_EQUAL(&ti->cpus, &curr)) continue;
                     if (ti->cpuset_dir[0]) {
                         int fd = openat(topo->base_cpuset_fd, ti->cpuset_dir, O_RDONLY | O_DIRECTORY);
                         if (fd != -1) {
