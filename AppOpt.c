@@ -4,16 +4,19 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <fnmatch.h>
+#include <pthread.h>
 #include <sched.h>
+#include <stdatomic.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/sysinfo.h>
+#include <sys/inotify.h>
 #include <sys/stat.h>
+#include <sys/sysinfo.h>
 #include <unistd.h>
 
-#define VERSION            "1.3.5"
+#define VERSION            "1.3.18"
 #define BASE_CPUSET        "/dev/cpuset/AppOpt"
 #define MAX_PKG_LEN        128
 #define MAX_THREAD_LEN     32
@@ -52,6 +55,7 @@ typedef struct {
 } CpuTopology;
 
 typedef struct {
+    atomic_int ref_count;
     AffinityRule* rules;
     size_t num_rules;
     time_t mtime;
@@ -66,6 +70,12 @@ typedef struct {
     size_t num_procs;
     int last_proc_count;
 } ProcCache;
+
+static atomic_int config_updated = ATOMIC_VAR_INIT(0);
+static int inotify_fd = -1;
+static int inotify_wd = -1;
+static int inotify_supported = 0;
+static _Atomic(AppConfig*) current_config = NULL;
 
 static char* strtrim(char* s) {
     char* end;
@@ -231,7 +241,7 @@ static CpuTopology init_cpu_topo(void) {
     char mems_path[256];
     build_str(mems_path, sizeof(mems_path), BASE_CPUSET, "/mems", NULL);
     if (!read_file(AT_FDCWD, mems_path, topo.mems_str, sizeof(topo.mems_str))) {
-        strcpy(topo.mems_str, "0");
+        build_str(topo.mems_str, sizeof(topo.mems_str), "0", NULL);
     } else {
         strtrim(topo.mems_str);
     }
@@ -239,19 +249,25 @@ static CpuTopology init_cpu_topo(void) {
     return topo;
 }
 
-static bool load_config(AppConfig* cfg) {
+static AppConfig* load_config(const char* config_file, const CpuTopology* topo, time_t* last_mtime) { 
     struct stat st;
-    if (stat(cfg->config_file, &st) != 0) {
-        const char* initial_content = "# 规则编写与使用说明请参考 http://AppOpt.suto.top\n\n";
-        if (write_file(AT_FDCWD, cfg->config_file, initial_content, O_WRONLY | O_CREAT | O_TRUNC)) {
-            cfg->mtime = 0;
-        }
-        return false;
+    if (stat(config_file, &st)) return NULL;
+    AppConfig* cfg = calloc(1, sizeof(AppConfig));
+    if (!cfg) return NULL;
+    cfg->ref_count = 1;
+    cfg->topo = *topo;
+    build_str(cfg->config_file, sizeof(cfg->config_file), config_file, NULL);
+
+    if (last_mtime && *last_mtime == st.st_mtime && *last_mtime != -1) {
+        free(cfg);
+        return NULL;
     }
 
-    if (st.st_mtime <= cfg->mtime) return false;
-    FILE* fp = fopen(cfg->config_file, "r");
-    if (!fp) return false;
+    FILE* fp = fopen(config_file, "r");
+    if (!fp) {
+        free(cfg);
+        return NULL;
+    }
 
     AffinityRule* new_rules = NULL;
     char** new_pkgs = NULL;
@@ -327,12 +343,13 @@ static bool load_config(AppConfig* cfg) {
         }
     }
 
-    free(cfg->rules);
-    if (cfg->pkgs != NULL) {
+    if (cfg->rules) free(cfg->rules);
+    if (cfg->pkgs) {
         for (size_t i = 0; i < cfg->num_pkgs; i++) free(cfg->pkgs[i]);
         free(cfg->pkgs);
     }
 
+    if (last_mtime) *last_mtime = st.st_mtime;
     cfg->rules = new_rules;
     cfg->num_rules = rules_cnt;
     cfg->pkgs = new_pkgs;
@@ -340,17 +357,18 @@ static bool load_config(AppConfig* cfg) {
     cfg->mtime = st.st_mtime;
 
     fclose(fp);
-    printf("Config file loaded, Total of %zu rules.\n", rules_cnt);
-    return true;
+    printf("配置文件解析完成，共加载 %zu 条规则\n", rules_cnt);
+    return cfg;
 
 error:
-    free(new_rules);
-    if (new_pkgs != NULL) {
+    if (new_rules) free(new_rules);
+    if (new_pkgs) {
         for (size_t i = 0; i < pkgs_cnt; i++) free(new_pkgs[i]);
         free(new_pkgs);
     }
     fclose(fp);
-    return false;
+    free(cfg);
+    return NULL;
 }
 
 static ProcessInfo* proc_collect(const AppConfig* cfg, size_t* count) {
@@ -367,7 +385,7 @@ static ProcessInfo* proc_collect(const AppConfig* cfg, size_t* count) {
     struct dirent* ent;
 
     while ((ent = readdir(proc_dir))) {
-		if (!isdigit(ent->d_name[0])) continue;
+        if (!isdigit(ent->d_name[0])) continue;
 
         char* endptr;
         unsigned long pid_ul = strtoul(ent->d_name, &endptr, 10);
@@ -599,44 +617,150 @@ static void apply_affinity(ProcCache* cache, const CpuTopology* topo) {
     }
 }
 
+static void config_release(AppConfig* cfg) {
+    if (!cfg) return;
+    if (atomic_fetch_sub(&cfg->ref_count, 1) == 1) {
+        if (cfg->rules) free(cfg->rules);
+        if (cfg->pkgs) {
+            for (size_t i = 0; i < cfg->num_pkgs; i++) free(cfg->pkgs[i]);
+            free(cfg->pkgs);
+        }
+        free(cfg);
+    }
+}
+
+static void* config_loader_thread(void* arg) {
+    int interval = *(int*)arg;
+    free(arg);
+    pthread_setname_np(pthread_self(), "ConfigLoader");
+
+    time_t last_mtime = -1;
+    while (1) {
+        if (inotify_supported) {
+            fd_set rfds;
+            struct timeval tv;
+            FD_ZERO(&rfds);
+            FD_SET(inotify_fd, &rfds);
+            tv.tv_sec = interval;
+            tv.tv_usec = 0;
+
+            int ret = select(inotify_fd + 1, &rfds, NULL, NULL, &tv);
+            if (ret < 0) {
+                if (errno == EINTR) continue;
+                inotify_supported = 0;
+                close(inotify_fd);
+                inotify_fd = -1;
+                continue;
+            } else if (ret == 0) {
+                continue;
+            }
+
+            char buf[4096] __attribute__((aligned(8)));
+            ssize_t len = read(inotify_fd, buf, sizeof(buf));
+            if (len <= 0) {
+                if (errno != EAGAIN && errno != EWOULDBLOCK) {
+                    inotify_supported = 0;
+                    close(inotify_fd);
+                    inotify_fd = -1;
+                }
+                continue;
+            }
+
+            bool reload_needed = false;
+            for (char* p = buf; p < buf + len;) {
+                struct inotify_event* event = (struct inotify_event*)p;
+                if (event->mask & (IN_CLOSE_WRITE | IN_DELETE_SELF | IN_MOVE_SELF)) {
+                    reload_needed = true;
+
+                    if (event->mask & (IN_DELETE_SELF | IN_MOVE_SELF)) {
+                        sleep(interval);
+                        AppConfig* cfg = atomic_load(&current_config);
+                        if (cfg) {
+                            atomic_fetch_add(&cfg->ref_count, 1);
+                            inotify_rm_watch(inotify_fd, inotify_wd);
+                            inotify_wd = inotify_add_watch(inotify_fd, cfg->config_file, IN_CLOSE_WRITE | IN_DELETE_SELF | IN_MOVE_SELF);
+                            last_mtime = -1;
+                            config_release(cfg);
+                        }
+                        if (inotify_wd < 0) {
+                            inotify_supported = 0;
+                            close(inotify_fd);
+                            inotify_fd = -1;
+                            break;
+                        }
+                    }
+                }
+                p += sizeof(struct inotify_event) + event->len;
+            }
+
+            if (reload_needed) {
+                AppConfig* cfg = atomic_load(&current_config);
+                if (cfg) atomic_fetch_add(&cfg->ref_count, 1);
+                if (cfg) {
+                    AppConfig* new_config = load_config(cfg->config_file, &cfg->topo, &last_mtime);
+                    if (new_config) {
+                        AppConfig* old_config = atomic_exchange(&current_config, new_config);
+                        atomic_store(&config_updated, 1);
+                        if (old_config) config_release(old_config);
+                    }
+                    config_release(cfg);
+                }
+            }
+        } else {
+            AppConfig* cfg = atomic_load(&current_config);
+            if (cfg) {
+                atomic_fetch_add(&cfg->ref_count, 1);
+                AppConfig* new_config = load_config(cfg->config_file, &cfg->topo, &last_mtime);
+                if (new_config) {
+                    AppConfig* old_config = atomic_exchange(&current_config, new_config);
+                    atomic_store(&config_updated, 1);
+                    if (old_config) config_release(old_config);
+                }
+                config_release(cfg);
+            }
+            sleep(interval);
+        }
+    }
+    return NULL;
+}
+
 static void print_help(const char* prog_name) {
     printf("Usage: %s [OPTIONS]\n", prog_name);
     printf("Options:\n");
-    printf("  -c <config_file>   Specify configuration file (default: ./applist.conf)\n");
-    printf("  -s <interval>      Set sleep interval in seconds (must be >=1, default: 2)\n");
-    printf("  -v                 Display program version\n");
-    printf("  -h                 Display this help message\n");
-    printf("\nExample:\n");
+    printf("  -c <config_file>   指定配置文件 (默认: ./applist.conf)\n");
+    printf("  -s <interval>      设置检查间隔(秒) (必须>=1, 默认: 2)\n");
+    printf("  -v                 显示程序版本\n");
+    printf("  -h                 显示帮助信息\n");
+    printf("\n示例:\n");
     printf("  %s -c /data/applist.conf -s 3\n", prog_name);
 }
 
 int main(int argc, char **argv) {
-    AppConfig config = { .topo = init_cpu_topo() };
-    build_str(config.config_file, sizeof(config.config_file), "./applist.conf", NULL);
+    CpuTopology topo = init_cpu_topo();
+    char config_file[4096] = "./applist.conf";
     int sleep_interval = 2;
-
     int opt;
     while ((opt = getopt(argc, argv, "c:s:hv")) != -1) {
         switch (opt) {
             case 'c':
-                build_str(config.config_file, sizeof(config.config_file), optarg, NULL);
-                printf("Config file: %s\n", config.config_file);
+                build_str(config_file, sizeof(config_file), optarg, NULL);
+                printf("配置文件: %s\n", config_file);
                 break;
             case 's':
             {
                 char *endptr;
                 long val = strtol(optarg, &endptr, 10);
                 if (endptr == optarg || *endptr != '\0' || val < 1) {
-                    fprintf(stderr, "Invalid interval value: %s\n", optarg);
-                    fprintf(stderr, "Interval must be an integer >=1\n");
+                    fprintf(stderr, "无效的时间间隔: %s\n", optarg);
+                    fprintf(stderr, "间隔必须是 >=1 的整数\n");
                     exit(EXIT_FAILURE);
                 }
                 sleep_interval = (int)val;
-                printf("Sleep interval: %d s\n", sleep_interval);
+                printf("检查间隔: %d 秒\n", sleep_interval);
                 break;
             }
             case 'v':
-                printf("AppOpt version %s\n", VERSION);
+                printf("AppOpt 版本 %s\n", VERSION);
                 exit(EXIT_SUCCESS);
             case 'h':
                 print_help(argv[0]);
@@ -647,22 +771,71 @@ int main(int argc, char **argv) {
         }
     }
 
+    struct stat st;
+    if (stat(config_file, &st) != 0) {
+        const char* initial_content = "# 规则编写与使用说明请参考 http://AppOpt.suto.top\n\n";
+        if (write_file(AT_FDCWD, config_file, initial_content, O_WRONLY | O_CREAT | O_TRUNC)) {
+            printf("配置文件不存在，重建一个空的配置文件: %s\n", config_file);
+        }
+    }
+
+    AppConfig* initial_config = load_config(config_file, &topo, NULL);
+    if (!initial_config) {
+        fprintf(stderr, "初始配置加载失败\n");
+        exit(EXIT_FAILURE);
+    }
+    atomic_store(&current_config, initial_config);
+    atomic_store(&config_updated, 1);
+
+    inotify_fd = inotify_init1(IN_CLOEXEC);
+    if (inotify_fd >= 0) {
+        int flags = fcntl(inotify_fd, F_GETFL);
+        if (flags >= 0) fcntl(inotify_fd, F_SETFL, flags | O_NONBLOCK);
+        inotify_wd = inotify_add_watch(inotify_fd, config_file, IN_CLOSE_WRITE | IN_DELETE_SELF | IN_MOVE_SELF);
+        if (inotify_wd >= 0) {
+            inotify_supported = 1;
+            printf("启用inotify监控配置文件变更\n");
+        } else {
+            close(inotify_fd);
+            inotify_fd = -1;
+            printf("inotify初始化失败，使用轮询模式\n");
+        }
+    }
+
+    pthread_t loader_thread;
+    int* interval_ptr = malloc(sizeof(int));
+    if (!interval_ptr) {
+        config_release(initial_config);
+        if (inotify_supported) close(inotify_fd);
+        exit(EXIT_FAILURE);
+    }
+    *interval_ptr = sleep_interval;
+
+    if (pthread_create(&loader_thread, NULL, config_loader_thread, interval_ptr) != 0) {
+        perror("配置加载器线程创建失败");
+        free(interval_ptr);
+        config_release(initial_config);
+        if (inotify_supported) close(inotify_fd);
+        exit(EXIT_FAILURE);
+    }
+    pthread_detach(loader_thread);
+
     ProcCache cache = {0};
-    int config_counter = 0;
     int affinity_counter = 0;
-    printf("Start AppOpt service.\n");
+    printf("启动AppOpt服务 v%s\n", VERSION);
 
     for (;;) {
-        config_counter--;
-        if (config_counter < 1) {
-            if (load_config(&config)) cache.last_proc_count = 0;
-            config_counter = 5;
-        }
-        update_cache(&cache, &config, &affinity_counter);
-        affinity_counter--;
-        if (affinity_counter < 1) {
-            apply_affinity(&cache, &config.topo);
-            affinity_counter = 5;
+        if (atomic_exchange(&config_updated, 0)) cache.last_proc_count = 0;
+        AppConfig* cfg = atomic_load(&current_config);
+        if (cfg) {
+            atomic_fetch_add(&cfg->ref_count, 1);
+            update_cache(&cache, cfg, &affinity_counter);
+            affinity_counter--;
+            if (affinity_counter < 1) {
+                apply_affinity(&cache, &cfg->topo);
+                affinity_counter = 5;
+            }
+            config_release(cfg);
         }
         sleep(sleep_interval);
     }
