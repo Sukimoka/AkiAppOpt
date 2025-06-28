@@ -16,7 +16,7 @@
 #include <sys/sysinfo.h>
 #include <unistd.h>
 
-#define VERSION            "1.3.18"
+#define VERSION            "1.5.6"
 #define BASE_CPUSET        "/dev/cpuset/AppOpt"
 #define MAX_PKG_LEN        128
 #define MAX_THREAD_LEN     32
@@ -42,8 +42,10 @@ typedef struct {
     cpu_set_t base_cpus;
     ThreadInfo* threads;
     size_t num_threads;
+    size_t threads_cap;
     AffinityRule** thread_rules;
     size_t num_thread_rules;
+    size_t thread_rules_cap;
 } ProcessInfo;
 
 typedef struct {
@@ -68,7 +70,12 @@ typedef struct {
 typedef struct {
     ProcessInfo* procs;
     size_t num_procs;
+    size_t procs_cap;
     int last_proc_count;
+    bool scan_all_proc;
+    pid_t* tracked_pids;
+    size_t num_tracked_pids;
+    size_t tracked_pids_cap;
 } ProcCache;
 
 static atomic_int config_updated = ATOMIC_VAR_INIT(0);
@@ -249,7 +256,7 @@ static CpuTopology init_cpu_topo(void) {
     return topo;
 }
 
-static AppConfig* load_config(const char* config_file, const CpuTopology* topo, time_t* last_mtime) { 
+static AppConfig* load_config(const char* config_file, const CpuTopology* topo, time_t* last_mtime) {
     struct stat st;
     if (stat(config_file, &st)) return NULL;
     AppConfig* cfg = calloc(1, sizeof(AppConfig));
@@ -371,25 +378,43 @@ error:
     return NULL;
 }
 
-static ProcessInfo* proc_collect(const AppConfig* cfg, size_t* count) {
+static void proc_collect(const AppConfig* cfg, ProcCache* cache, size_t* count) {
     DIR* proc_dir = opendir("/proc");
-    if (!proc_dir) return NULL;
+    if (!proc_dir) return;
     int proc_fd = dirfd(proc_dir);
-    size_t proc_cap = 2048;
-    ProcessInfo* new_procs = malloc(proc_cap * sizeof(ProcessInfo));
-    if (!new_procs) {
-        closedir(proc_dir);
-        return NULL;
-    }
     *count = 0;
+
+    if (cache->procs == NULL) {
+        cache->procs_cap = 2048;
+        cache->procs = calloc(cache->procs_cap, sizeof(ProcessInfo));
+        if (!cache->procs) {
+            closedir(proc_dir);
+            return;
+        }
+    }
+
     struct dirent* ent;
-
+    time_t current_time = time(NULL);
     while ((ent = readdir(proc_dir))) {
-        if (!isdigit(ent->d_name[0])) continue;
+        char *end;
+        long pid = strtol(ent->d_name, &end, 10);
+        if (*end != '\0')  continue;
 
-        char* endptr;
-        unsigned long pid_ul = strtoul(ent->d_name, &endptr, 10);
-        pid_t pid = (pid_t)pid_ul;
+        if (!cache->scan_all_proc) {
+            bool is_tracked = false;
+            for (size_t i = 0; i < cache->num_tracked_pids; i++) {
+                if (cache->tracked_pids[i] == pid) {
+                    is_tracked = true;
+                    break;
+                }
+            }
+            if (!is_tracked) {
+                struct stat statbuf;
+                if (fstatat(proc_fd, ent->d_name, &statbuf, AT_SYMLINK_NOFOLLOW) != 0) continue;
+                if (current_time - statbuf.st_mtime > 60) continue;
+            }
+        }
+
         int pid_fd = openat(proc_fd, ent->d_name, O_RDONLY | O_DIRECTORY);
         if (pid_fd == -1) continue;
 
@@ -413,75 +438,90 @@ static ProcessInfo* proc_collect(const AppConfig* cfg, size_t* count) {
             continue;
         }
 
-        ProcessInfo proc = {0};
-        proc.pid = pid;
-        build_str(proc.pkg, sizeof(proc.pkg), name, NULL);
-        CPU_ZERO(&proc.base_cpus);
-        proc.base_cpuset[0] = '\0';
-
-        size_t thrules_cap = 8;
-        proc.thread_rules = malloc(thrules_cap * sizeof(AffinityRule*));
-        if (!proc.thread_rules) {
-            close(pid_fd);
-            continue;
+        if (*count >= cache->procs_cap) {
+            size_t new_cap = cache->procs_cap * 2;
+            ProcessInfo* new_procs = realloc(cache->procs, new_cap * sizeof(ProcessInfo));
+            if (!new_procs) {
+                close(pid_fd);
+                continue;
+            }
+            memset(new_procs + cache->procs_cap, 0, (new_cap - cache->procs_cap) * sizeof(ProcessInfo));
+            cache->procs = new_procs;
+            cache->procs_cap = new_cap;
         }
-        proc.num_thread_rules = 0;
+
+        ProcessInfo* proc = &cache->procs[*count];
+
+        proc->pid = pid;
+        build_str(proc->pkg, sizeof(proc->pkg), name, NULL);
+        CPU_ZERO(&proc->base_cpus);
+        proc->base_cpuset[0] = '\0';
+        proc->num_threads = 0;
+        proc->num_thread_rules = 0;
+
+        if (!proc->thread_rules || proc->thread_rules_cap < 8) {
+            size_t new_cap = proc->thread_rules_cap ? proc->thread_rules_cap * 2 : 8;
+            AffinityRule** tmp = realloc(proc->thread_rules, new_cap * sizeof(AffinityRule*));
+            if (!tmp) {
+                close(pid_fd);
+                continue;
+            }
+            proc->thread_rules = tmp;
+            proc->thread_rules_cap = new_cap;
+        }
 
         for (size_t i = 0; i < cfg->num_rules; i++) {
             const AffinityRule* rule = &cfg->rules[i];
-            if (strcmp(rule->pkg, proc.pkg) != 0) continue;
+            if (strcmp(rule->pkg, proc->pkg) != 0) continue;
 
             if (rule->thread[0]) {
-                if (proc.num_thread_rules >= thrules_cap) {
-                    thrules_cap *= 2;
-                    AffinityRule** tmp = realloc(proc.thread_rules, thrules_cap * sizeof(AffinityRule*));
+                if (proc->num_thread_rules >= proc->thread_rules_cap) {
+                    size_t new_cap = proc->thread_rules_cap * 2;
+                    AffinityRule** tmp = realloc(proc->thread_rules, new_cap * sizeof(AffinityRule*));
                     if (!tmp) break;
-                    proc.thread_rules = tmp;
+                    proc->thread_rules = tmp;
+                    proc->thread_rules_cap = new_cap;
                 }
-                proc.thread_rules[proc.num_thread_rules++] = (AffinityRule*)rule;
+                proc->thread_rules[proc->num_thread_rules++] = (AffinityRule*)rule;
             } else {
-                CPU_OR(&proc.base_cpus, &proc.base_cpus, &rule->cpus);
-                build_str(proc.base_cpuset, sizeof(proc.base_cpuset), rule->cpuset_dir, NULL);
+                CPU_OR(&proc->base_cpus, &proc->base_cpus, &rule->cpus);
+                build_str(proc->base_cpuset, sizeof(proc->base_cpuset), rule->cpuset_dir, NULL);
             }
         }
 
-        if (CPU_COUNT(&proc.base_cpus) == 0 && proc.num_thread_rules == 0) {
+        if (CPU_COUNT(&proc->base_cpus) == 0 && proc->num_thread_rules == 0) {
             close(pid_fd);
-            free(proc.thread_rules);
             continue;
         }
 
         int task_fd = openat(pid_fd, "task", O_RDONLY | O_DIRECTORY);
         close(pid_fd);
         if (task_fd == -1) {
-            free(proc.thread_rules);
             continue;
         }
 
         DIR* task_dir = fdopendir(task_fd);
         if (!task_dir) {
             close(task_fd);
-            free(proc.thread_rules);
             continue;
         }
 
-        size_t thread_cap = 256;
-        ThreadInfo* threads = malloc(thread_cap * sizeof(ThreadInfo));
-        if (!threads) {
-            closedir(task_dir);
-            free(proc.thread_rules);
-            continue;
+        if (!proc->threads || proc->threads_cap < 512) {
+            size_t new_cap = proc->threads_cap ? proc->threads_cap * 2 : 64;
+            ThreadInfo* tmp = realloc(proc->threads, new_cap * sizeof(ThreadInfo));
+            if (!tmp) {
+                closedir(task_dir);
+                continue;
+            }
+            proc->threads = tmp;
+            proc->threads_cap = new_cap;
         }
-        size_t tcount = 0;
+
         struct dirent* tent;
-
         while ((tent = readdir(task_dir))) {
-            if (!isdigit(tent->d_name[0])) continue;
-
-            char* endptr2;
-            unsigned long tid_ul = strtoul(tent->d_name, &endptr2, 10);
-            pid_t tid = (pid_t)tid_ul;
-
+            char *end2;
+            long tid = strtol(tent->d_name, &end2, 10);
+            if (*end2 != '\0')  continue;
             char tname[MAX_THREAD_LEN] = {0};
 
             int tid_fd = openat(task_fd, tent->d_name, O_RDONLY | O_DIRECTORY);
@@ -494,54 +534,43 @@ static ProcessInfo* proc_collect(const AppConfig* cfg, size_t* count) {
             close(tid_fd);
 
             strtrim(tname);
-            ThreadInfo ti = { .tid = tid };
-            build_str(ti.name, sizeof(ti.name), tname, NULL);
-            CPU_ZERO(&ti.cpus);
+
+            if (proc->num_threads >= proc->threads_cap) {
+                size_t new_cap = proc->threads_cap * 2;
+                ThreadInfo* tmp = realloc(proc->threads, new_cap * sizeof(ThreadInfo));
+                if (!tmp) continue;
+                proc->threads = tmp;
+                proc->threads_cap = new_cap;
+            }
+
+            ThreadInfo* ti = &proc->threads[proc->num_threads];
+            ti->tid = tid;
+            build_str(ti->name, sizeof(ti->name), tname, NULL);
+            CPU_ZERO(&ti->cpus);
             const char* matched = NULL;
 
-            for (size_t i = 0; i < proc.num_thread_rules; i++) {
-                const AffinityRule* rule = proc.thread_rules[i];
-                if (fnmatch(rule->thread, ti.name, FNM_NOESCAPE) == 0) {
-                    CPU_OR(&ti.cpus, &ti.cpus, &rule->cpus);
+            for (size_t i = 0; i < proc->num_thread_rules; i++) {
+                const AffinityRule* rule = proc->thread_rules[i];
+                if (fnmatch(rule->thread, ti->name, FNM_NOESCAPE) == 0) {
+                    CPU_OR(&ti->cpus, &ti->cpus, &rule->cpus);
                     matched = rule->cpuset_dir;
                 }
             }
 
             if (matched) {
-                build_str(ti.cpuset_dir, sizeof(ti.cpuset_dir), matched, NULL);
+                build_str(ti->cpuset_dir, sizeof(ti->cpuset_dir), matched, NULL);
             } else {
-                ti.cpus = proc.base_cpus;
-                build_str(ti.cpuset_dir, sizeof(ti.cpuset_dir), proc.base_cpuset, NULL);
+                ti->cpus = proc->base_cpus;
+                build_str(ti->cpuset_dir, sizeof(ti->cpuset_dir), proc->base_cpuset, NULL);
             }
 
-            if (tcount >= thread_cap) {
-                thread_cap *= 2;
-                ThreadInfo* tmp = realloc(threads, thread_cap * sizeof(ThreadInfo));
-                if (!tmp) continue;
-                threads = tmp;
-            }
-            threads[tcount++] = ti;
+            proc->num_threads++;
         }
 
-        proc.threads = threads;
-        proc.num_threads = tcount;
-
-        if (*count >= proc_cap) {
-            proc_cap *= 2;
-            ProcessInfo* tmp = realloc(new_procs, proc_cap * sizeof(ProcessInfo));
-            if (!tmp) {
-                free(threads);
-                free(proc.thread_rules);
-                closedir(task_dir);
-                continue;
-            }
-            new_procs = tmp;
-        }
-        new_procs[(*count)++] = proc;
         closedir(task_dir);
+        (*count)++;
     }
     closedir(proc_dir);
-    return new_procs;
 }
 
 static void update_cache(ProcCache* cache, const AppConfig* cfg, int* affinity_counter) {
@@ -551,7 +580,7 @@ static void update_cache(ProcCache* cache, const AppConfig* cfg, int* affinity_c
         need_reload = true;
     } else {
         int current_proc_count = info.procs;
-        if (current_proc_count > cache->last_proc_count + 15) {
+        if (current_proc_count > cache->last_proc_count + 11) {
             need_reload = true;
         } else if (current_proc_count > cache->last_proc_count) {
             *affinity_counter = 0;
@@ -561,25 +590,36 @@ static void update_cache(ProcCache* cache, const AppConfig* cfg, int* affinity_c
     if (cache->procs != NULL && !need_reload) {
         for (size_t i = 0; i < cache->num_procs; i++) {
             if (kill(cache->procs[i].pid, 0) != 0) {
-                need_reload = true;
+                cache->scan_all_proc = true;
                 break;
             }
         }
     }
-    if (need_reload) {
-        size_t count;
-        ProcessInfo* new_procs = proc_collect(cfg, &count);
-        if (!new_procs) return;
-        if (cache->procs) {
-            for (size_t i = 0; i < cache->num_procs; i++) {
-                free(cache->procs[i].threads);
-                free(cache->procs[i].thread_rules);
+    if (need_reload || cache->scan_all_proc) {
+        size_t new_count = 0;
+        proc_collect(cfg, cache, &new_count);
+
+        if (new_count > cache->tracked_pids_cap) {
+            size_t new_cap = cache->tracked_pids_cap ? cache->tracked_pids_cap * 2 : new_count;
+            pid_t* new_pids = realloc(cache->tracked_pids, new_cap * sizeof(pid_t));
+            if (new_pids) {
+                cache->tracked_pids = new_pids;
+                cache->tracked_pids_cap = new_cap;
             }
-            free(cache->procs);
         }
-        cache->procs = new_procs;
-        cache->num_procs = count;
+
+        if (cache->tracked_pids) {
+            cache->num_tracked_pids = 0;
+            for (size_t i = 0; i < new_count; i++) {
+                if (cache->num_tracked_pids < cache->tracked_pids_cap) {
+                    cache->tracked_pids[cache->num_tracked_pids++] = cache->procs[i].pid;
+                }
+            }
+        }
+        
+        cache->num_procs = new_count;
         *affinity_counter = 0;
+        if (cache->scan_all_proc) cache->scan_all_proc = false;
     }
 }
 
@@ -629,6 +669,21 @@ static void config_release(AppConfig* cfg) {
     }
 }
 
+static AppConfig* get_config() {
+    AppConfig* cfg = atomic_load_explicit(&current_config, memory_order_acquire);
+    if (!cfg) return NULL;
+    int old_ref = atomic_fetch_add_explicit(&cfg->ref_count, 1, memory_order_acq_rel);
+    if (old_ref <= 0) {
+        atomic_fetch_sub_explicit(&cfg->ref_count, 1, memory_order_release);
+        return NULL;
+    }
+    if (atomic_load_explicit(&current_config, memory_order_acquire) != cfg) {
+        atomic_fetch_sub_explicit(&cfg->ref_count, 1, memory_order_release);
+        return NULL;
+    }
+    return cfg;
+}
+
 static void* config_loader_thread(void* arg) {
     int interval = *(int*)arg;
     free(arg);
@@ -674,9 +729,8 @@ static void* config_loader_thread(void* arg) {
 
                     if (event->mask & (IN_DELETE_SELF | IN_MOVE_SELF)) {
                         sleep(interval);
-                        AppConfig* cfg = atomic_load(&current_config);
+                        AppConfig* cfg = get_config();
                         if (cfg) {
-                            atomic_fetch_add(&cfg->ref_count, 1);
                             inotify_rm_watch(inotify_fd, inotify_wd);
                             inotify_wd = inotify_add_watch(inotify_fd, cfg->config_file, IN_CLOSE_WRITE | IN_DELETE_SELF | IN_MOVE_SELF);
                             last_mtime = -1;
@@ -694,8 +748,7 @@ static void* config_loader_thread(void* arg) {
             }
 
             if (reload_needed) {
-                AppConfig* cfg = atomic_load(&current_config);
-                if (cfg) atomic_fetch_add(&cfg->ref_count, 1);
+                AppConfig* cfg = get_config();
                 if (cfg) {
                     AppConfig* new_config = load_config(cfg->config_file, &cfg->topo, &last_mtime);
                     if (new_config) {
@@ -707,9 +760,8 @@ static void* config_loader_thread(void* arg) {
                 }
             }
         } else {
-            AppConfig* cfg = atomic_load(&current_config);
+            AppConfig* cfg = get_config();
             if (cfg) {
-                atomic_fetch_add(&cfg->ref_count, 1);
                 AppConfig* new_config = load_config(cfg->config_file, &cfg->topo, &last_mtime);
                 if (new_config) {
                     AppConfig* old_config = atomic_exchange(&current_config, new_config);
@@ -821,14 +873,15 @@ int main(int argc, char **argv) {
     pthread_detach(loader_thread);
 
     ProcCache cache = {0};
+    cache.scan_all_proc = true;
     int affinity_counter = 0;
     printf("启动AppOpt服务 v%s\n", VERSION);
 
     for (;;) {
-        if (atomic_exchange(&config_updated, 0)) cache.last_proc_count = 0;
-        AppConfig* cfg = atomic_load(&current_config);
+        if (atomic_exchange(&config_updated, 0)) cache.scan_all_proc = true;
+
+        AppConfig* cfg = get_config();
         if (cfg) {
-            atomic_fetch_add(&cfg->ref_count, 1);
             update_cache(&cache, cfg, &affinity_counter);
             affinity_counter--;
             if (affinity_counter < 1) {
