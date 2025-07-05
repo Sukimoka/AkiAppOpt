@@ -16,7 +16,7 @@
 #include <sys/sysinfo.h>
 #include <unistd.h>
 
-#define VERSION            "1.5.6"
+#define VERSION            "1.5.8"
 #define BASE_CPUSET        "/dev/cpuset/AppOpt"
 #define MAX_PKG_LEN        128
 #define MAX_THREAD_LEN     32
@@ -587,7 +587,7 @@ static void update_cache(ProcCache* cache, const AppConfig* cfg, int* affinity_c
         }
         cache->last_proc_count = current_proc_count;
     }
-    if (cache->procs != NULL && !need_reload) {
+    if (cache->procs != NULL && !cache->scan_all_proc) {
         for (size_t i = 0; i < cache->num_procs; i++) {
             if (kill(cache->procs[i].pid, 0) != 0) {
                 cache->scan_all_proc = true;
@@ -651,7 +651,7 @@ static void apply_affinity(ProcCache* cache, const CpuTopology* topo) {
             }
             if (CPU_COUNT(&ti->cpus) == 0) continue;
             if (sched_setaffinity(ti->tid, sizeof(ti->cpus), &ti->cpus) == -1 && errno == ESRCH) {
-                cache->last_proc_count = 0;
+                cache->scan_all_proc = true;
             }
         }
     }
