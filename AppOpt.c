@@ -16,7 +16,7 @@
 #include <sys/sysinfo.h>
 #include <unistd.h>
 
-#define VERSION            "1.5.8"
+#define VERSION            "1.6.1"
 #define BASE_CPUSET        "/dev/cpuset/AppOpt"
 #define MAX_PKG_LEN        128
 #define MAX_THREAD_LEN     32
@@ -76,6 +76,7 @@ typedef struct {
     pid_t* tracked_pids;
     size_t num_tracked_pids;
     size_t tracked_pids_cap;
+    int last_proc_total;
 } ProcCache;
 
 static atomic_int config_updated = ATOMIC_VAR_INIT(0);
@@ -395,10 +396,12 @@ static void proc_collect(const AppConfig* cfg, ProcCache* cache, size_t* count) 
 
     struct dirent* ent;
     time_t current_time = time(NULL);
+    int current_proc_total = 0;
     while ((ent = readdir(proc_dir))) {
         char *end;
         long pid = strtol(ent->d_name, &end, 10);
         if (*end != '\0')  continue;
+        current_proc_total++;
 
         if (!cache->scan_all_proc) {
             bool is_tracked = false;
@@ -571,6 +574,12 @@ static void proc_collect(const AppConfig* cfg, ProcCache* cache, size_t* count) 
         (*count)++;
     }
     closedir(proc_dir);
+    if (current_proc_total > cache->last_proc_total) {
+        cache->scan_all_proc = true;
+    } else {
+        cache->scan_all_proc = false;
+    }
+    cache->last_proc_total = current_proc_total;
 }
 
 static void update_cache(ProcCache* cache, const AppConfig* cfg, int* affinity_counter) {
@@ -587,15 +596,15 @@ static void update_cache(ProcCache* cache, const AppConfig* cfg, int* affinity_c
         }
         cache->last_proc_count = current_proc_count;
     }
-    if (cache->procs != NULL && !cache->scan_all_proc) {
+    if (cache->procs != NULL && !need_reload) {
         for (size_t i = 0; i < cache->num_procs; i++) {
             if (kill(cache->procs[i].pid, 0) != 0) {
-                cache->scan_all_proc = true;
+                need_reload = true;
                 break;
             }
         }
     }
-    if (need_reload || cache->scan_all_proc) {
+    if (need_reload) {
         size_t new_count = 0;
         proc_collect(cfg, cache, &new_count);
 
@@ -619,7 +628,6 @@ static void update_cache(ProcCache* cache, const AppConfig* cfg, int* affinity_c
         
         cache->num_procs = new_count;
         *affinity_counter = 0;
-        if (cache->scan_all_proc) cache->scan_all_proc = false;
     }
 }
 
@@ -651,7 +659,7 @@ static void apply_affinity(ProcCache* cache, const CpuTopology* topo) {
             }
             if (CPU_COUNT(&ti->cpus) == 0) continue;
             if (sched_setaffinity(ti->tid, sizeof(ti->cpus), &ti->cpus) == -1 && errno == ESRCH) {
-                cache->scan_all_proc = true;
+                cache->last_proc_count = 0;
             }
         }
     }
@@ -873,7 +881,6 @@ int main(int argc, char **argv) {
     pthread_detach(loader_thread);
 
     ProcCache cache = {0};
-    cache.scan_all_proc = true;
     int affinity_counter = 0;
     printf("启动AppOpt服务 v%s\n", VERSION);
 
