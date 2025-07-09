@@ -16,7 +16,7 @@
 #include <sys/sysinfo.h>
 #include <unistd.h>
 
-#define VERSION            "1.6.1"
+#define VERSION            "1.6.3"
 #define BASE_CPUSET        "/dev/cpuset/AppOpt"
 #define MAX_PKG_LEN        128
 #define MAX_THREAD_LEN     32
@@ -885,7 +885,10 @@ int main(int argc, char **argv) {
     printf("启动AppOpt服务 v%s\n", VERSION);
 
     for (;;) {
-        if (atomic_exchange(&config_updated, 0)) cache.scan_all_proc = true;
+        if (atomic_exchange(&config_updated, 0)) {
+            cache.scan_all_proc = true;
+            cache.last_proc_count = 0;
+        }
 
         AppConfig* cfg = get_config();
         if (cfg) {
