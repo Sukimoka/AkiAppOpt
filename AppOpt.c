@@ -379,6 +379,10 @@ error:
     return NULL;
 }
 
+static int pid_cmp(const void *a, const void *b) {
+    return (*(pid_t*)a - *(pid_t*)b);
+}
+
 static void proc_collect(const AppConfig* cfg, ProcCache* cache, size_t* count) {
     DIR* proc_dir = opendir("/proc");
     if (!proc_dir) return;
@@ -404,13 +408,9 @@ static void proc_collect(const AppConfig* cfg, ProcCache* cache, size_t* count) 
         current_proc_total++;
 
         if (!cache->scan_all_proc) {
-            bool is_tracked = false;
-            for (size_t i = 0; i < cache->num_tracked_pids; i++) {
-                if (cache->tracked_pids[i] == pid) {
-                    is_tracked = true;
-                    break;
-                }
-            }
+            bool is_tracked = (cache->num_tracked_pids > 0 &&
+                bsearch(&pid, cache->tracked_pids, cache->num_tracked_pids,
+                        sizeof(pid_t), pid_cmp) != NULL);
             if (!is_tracked) {
                 struct stat statbuf;
                 if (fstatat(proc_fd, ent->d_name, &statbuf, AT_SYMLINK_NOFOLLOW) != 0) continue;
@@ -639,6 +639,9 @@ static void update_cache(ProcCache* cache, const AppConfig* cfg, int* affinity_c
                 if (cache->num_tracked_pids < cache->tracked_pids_cap) {
                     cache->tracked_pids[cache->num_tracked_pids++] = cache->procs[i].pid;
                 }
+            }
+            if (cache->num_tracked_pids > 0) {
+                qsort(cache->tracked_pids, cache->num_tracked_pids, sizeof(pid_t), pid_cmp);
             }
         }
         
