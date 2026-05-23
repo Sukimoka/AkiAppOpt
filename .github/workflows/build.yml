@@ -28,12 +28,12 @@ jobs:
       - name: Build arm64-v8a
         run: |
           $NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android21-clang \
-            -O2 -s -static -o AppOpt-arm64-v8a AppOpt.c
+            -O2 -s -flto -o AppOpt-arm64-v8a AppOpt.c
 
       - name: Build armeabi-v7a
         run: |
           $NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin/armv7a-linux-androideabi21-clang \
-            -O2 -s -static -o AppOpt-armeabi-v7a AppOpt.c
+            -O2 -s -flto -o AppOpt-armeabi-v7a AppOpt.c
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
