@@ -571,6 +571,17 @@ static void proc_collect(const AppConfig* cfg, ProcCache* cache, size_t* count) 
         }
 
         closedir(task_dir);
+
+        if (proc->num_threads > 0 && proc->threads_cap > proc->num_threads * 2) {
+            size_t new_cap = proc->num_threads + proc->num_threads / 2;
+            if (new_cap < 64) new_cap = 64;
+            ThreadInfo* tmp = realloc(proc->threads, new_cap * sizeof(ThreadInfo));
+            if (tmp) {
+                proc->threads = tmp;
+                proc->threads_cap = new_cap;
+            }
+        }
+
         (*count)++;
     }
     closedir(proc_dir);
