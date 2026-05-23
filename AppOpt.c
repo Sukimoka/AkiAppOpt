@@ -596,15 +596,20 @@ static void update_cache(ProcCache* cache, const AppConfig* cfg, int* affinity_c
         }
         cache->last_proc_count = current_proc_count;
     }
-    if (cache->procs != NULL && !need_reload) {
-        for (size_t i = 0; i < cache->num_procs; i++) {
-            if (kill(cache->procs[i].pid, 0) != 0) {
-                need_reload = true;
-                break;
+    static int kill_check_skip = 0;
+    if (!need_reload && cache->procs != NULL) {
+        if (++kill_check_skip >= 5) {
+            kill_check_skip = 0;
+            for (size_t i = 0; i < cache->num_procs; i++) {
+                if (kill(cache->procs[i].pid, 0) != 0) {
+                    need_reload = true;
+                    break;
+                }
             }
         }
     }
     if (need_reload) {
+        kill_check_skip = 0;
         size_t new_count = 0;
         proc_collect(cfg, cache, &new_count);
 
