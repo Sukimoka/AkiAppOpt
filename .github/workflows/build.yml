@@ -1,0 +1,44 @@
+name: Build AppOpt
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: 'Branch to build'
+        required: true
+        default: 'Dev'
+        type: string
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.branch }}
+
+      - name: Setup Android NDK
+        run: |
+          NDK_VERSION="r27c"
+          NDK_URL="https://dl.google.com/android/repository/android-ndk-${NDK_VERSION}-linux.zip"
+          curl -sL -o ndk.zip "$NDK_URL"
+          unzip -q ndk.zip
+          echo "NDK_ROOT=$PWD/android-ndk-${NDK_VERSION}" >> $GITHUB_ENV
+
+      - name: Build arm64-v8a
+        run: |
+          $NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android21-clang \
+            -O2 -s -static -o AppOpt-arm64-v8a AppOpt.c
+
+      - name: Build armeabi-v7a
+        run: |
+          $NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin/armv7a-linux-androideabi21-clang \
+            -O2 -s -static -o AppOpt-armeabi-v7a AppOpt.c
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: AppOpt-${{ github.event.inputs.branch }}
+          path: |
+            AppOpt-arm64-v8a
+            AppOpt-armeabi-v7a
