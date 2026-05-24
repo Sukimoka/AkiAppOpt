@@ -526,15 +526,9 @@ static void proc_collect(const AppConfig* cfg, ProcCache* cache, size_t* count) 
             long tid = strtol(tent->d_name, &end2, 10);
             if (*end2 != '\0')  continue;
             char tname[MAX_THREAD_LEN] = {0};
-
-            int tid_fd = openat(task_fd, tent->d_name, O_RDONLY | O_DIRECTORY);
-            if (tid_fd == -1) continue;
-
-            if (!read_file(tid_fd, "comm", tname, sizeof(tname))) {
-                close(tid_fd);
-                continue;
-            }
-            close(tid_fd);
+            char comm_path[64];
+            snprintf(comm_path, sizeof(comm_path), "%s/comm", tent->d_name);
+            if (!read_file(task_fd, comm_path, tname, sizeof(tname))) continue;
 
             strtrim(tname);
 
