@@ -311,6 +311,18 @@ static AppConfig* load_config(const char* config_file, const CpuTopology* topo, 
 
         if (strlen(pkg) >= MAX_PKG_LEN || strlen(thread) >= MAX_THREAD_LEN) continue;
 
+        {
+            bool dup = false;
+            for (size_t i = 0; i < rules_cnt; i++) {
+                if (strcmp(new_rules[i].pkg, pkg) == 0 &&
+                    strcmp(new_rules[i].thread, thread) == 0) {
+                    dup = true;
+                    break;
+                }
+            }
+            if (dup) continue;
+        }
+
         cpu_set_t set;
         CPU_ZERO(&set);
         parse_cpu_ranges(cpus, &set, &cfg->topo.present_cpus);
