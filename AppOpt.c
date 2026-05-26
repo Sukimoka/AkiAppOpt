@@ -302,6 +302,13 @@ static AppConfig* load_config(const char* config_file, const CpuTopology* topo, 
 
         char* pkg = strtrim(p);
         char* cpus = strtrim(eq);
+
+        char* hash = strchr(cpus, '#');
+        if (hash) {
+            *hash = '\0';
+            cpus = strtrim(cpus);
+        }
+
         if (strlen(pkg) >= MAX_PKG_LEN || strlen(thread) >= MAX_THREAD_LEN) continue;
 
         cpu_set_t set;
