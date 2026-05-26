@@ -564,12 +564,26 @@ static void proc_collect(const AppConfig* cfg, ProcCache* cache, size_t* count) 
             build_str(ti->name, sizeof(ti->name), tname, NULL);
             CPU_ZERO(&ti->cpus);
             const char* matched = NULL;
+            int best_literal = -1;
 
             for (size_t i = 0; i < proc->num_thread_rules; i++) {
                 const AffinityRule* rule = proc->thread_rules[i];
-                if (fnmatch(rule->thread, ti->name, FNM_NOESCAPE) == 0) {
+                if (strcmp(rule->thread, ti->name) == 0) {
+                    CPU_ZERO(&ti->cpus);
                     CPU_OR(&ti->cpus, &ti->cpus, &rule->cpus);
                     matched = rule->cpuset_dir;
+                    break;
+                }
+                if (fnmatch(rule->thread, ti->name, FNM_NOESCAPE) == 0) {
+                    int lit = 0;
+                    for (const char *c = rule->thread; *c; c++)
+                        if (*c != '*' && *c != '?' && *c != '[') lit++;
+                    if (lit > best_literal) {
+                        best_literal = lit;
+                        CPU_ZERO(&ti->cpus);
+                        CPU_OR(&ti->cpus, &ti->cpus, &rule->cpus);
+                        matched = rule->cpuset_dir;
+                    }
                 }
             }
 
