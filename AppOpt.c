@@ -16,7 +16,7 @@
 #include <sys/sysinfo.h>
 #include <unistd.h>
 
-#define VERSION            "1.6.3"
+#define VERSION            "aki-0.1.0"
 #define BASE_CPUSET        "/dev/cpuset/AppOpt"
 #define MAX_PKG_LEN        128
 #define MAX_THREAD_LEN     32
